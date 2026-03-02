@@ -2,17 +2,19 @@
 """
 在线网页去水印自动化脚本。
 功能说明：
-1. 自动打开网页并上传图片。
-2. 上传成功后自动点击 Remove。
+1. 输入目录结构：input_images/<一级文件夹>/*.png|jpg|jpeg|webp
+2. 自动打开网页并上传图片，上传后自动点击 Remove。
 3. 处理完成后等待 Download Result 可点击并自动下载。
 4. 下载后统一转换为 .jpg；若文件超过 2MB，自动压缩到小于 2MB。
-5. 输出目录默认使用相对路径 .\\output_images，文件名保持原图名（仅后缀改为 .jpg）。
-6. 记录并输出每张图的关键时间点与耗时：上传、可下载、保存、总耗时。
+5. 输出目录结构：output_images/<同名一级文件夹>/
+6. 输出文件命名：<文件夹名><三位序号>.jpg（例如：尺寸001.jpg、黑003.jpg）
+7. 记录并输出每张图的关键时间点与耗时，以及每个文件夹和全量任务总耗时。
 """
 
 import asyncio
 import base64
 import io
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -31,12 +33,33 @@ def log(msg: str):
     print(msg, flush=True)
 
 
+def ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def is_image_file(p: Path) -> bool:
     return p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
 
 
-def ts() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def collect_input_groups(input_root: Path) -> list[tuple[Path, list[Path]]]:
+    groups: list[tuple[Path, list[Path]]] = []
+    for sub in sorted(input_root.iterdir()):
+        if not sub.is_dir():
+            continue
+        imgs = sorted([p for p in sub.iterdir() if p.is_file() and is_image_file(p)])
+        if imgs:
+            groups.append((sub, imgs))
+    return groups
+
+
+def get_next_index(out_subdir: Path, folder_name: str) -> int:
+    pattern = re.compile(rf"^{re.escape(folder_name)}(\d{{3}})\.jpg$", re.IGNORECASE)
+    max_idx = 0
+    for p in out_subdir.glob("*.jpg"):
+        m = pattern.match(p.name)
+        if m:
+            max_idx = max(max_idx, int(m.group(1)))
+    return max_idx + 1
 
 
 async def pick_file_input(page) -> Optional[str]:
@@ -180,15 +203,14 @@ async def click_download_and_save_raw(page, context, download_selector: str, raw
     raise PWTimeoutError("已点击 Download Result，但未拿到可下载内容")
 
 
-async def remove_one(context, in_path: Path, out_dir: Path, timeout_ms: int) -> Path:
+async def remove_one(context, in_path: Path, final_path: Path, timeout_ms: int) -> Path:
     if in_path.stat().st_size > MAX_INPUT_SIZE:
         raise ValueError(f"文件超过 10MB：{in_path.name}")
 
-    final_path = out_dir / f"{in_path.stem}.jpg"
-    raw_path = out_dir / f"{in_path.stem}.__raw__"
+    raw_path = final_path.with_suffix(".download")
 
     total_start = time.perf_counter()
-    log(f"  [{ts()}] 开始处理: {in_path.name}")
+    log(f"  [{ts()}] 开始处理: {in_path.name} -> {final_path.name}")
 
     page = await context.new_page()
     try:
@@ -246,7 +268,8 @@ async def remove_one(context, in_path: Path, out_dir: Path, timeout_ms: int) -> 
             raw_path.unlink()
 
         total_secs = time.perf_counter() - total_start
-        log(f"  [{ts()}] 保存完成: {final_path.name} | 保存耗时 {save_secs:.2f}s | 总耗时 {total_secs:.2f}s")
+        size_kb = final_path.stat().st_size / 1024
+        log(f"  [{ts()}] 保存完成: {final_path.name} ({size_kb:.1f} KB) | 保存耗时 {save_secs:.2f}s | 总耗时 {total_secs:.2f}s")
 
         return final_path
     finally:
@@ -259,42 +282,69 @@ async def batch_remove_watermarks_async(
     headless: bool = True,
     timeout_ms: int = 240_000,
 ):
-    in_dir = Path(input_dir).expanduser()
-    out_dir = Path(output_dir).expanduser()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    in_root = Path(input_dir).expanduser()
+    out_root = Path(output_dir).expanduser()
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    files = sorted([p for p in in_dir.iterdir() if p.is_file() and is_image_file(p)])
-    if not files:
-        raise FileNotFoundError(f"未找到图片：{in_dir}")
+    groups = collect_input_groups(in_root)
+    if not groups:
+        raise FileNotFoundError(f"未在一级子文件夹中找到图片：{in_root}")
 
-    log(f"找到 {len(files)} 张，输出目录：{out_dir}")
+    total_images = sum(len(imgs) for _, imgs in groups)
+    log(f"共发现 {len(groups)} 个文件夹，待处理图片总数：{total_images}")
+
+    overall_start = time.perf_counter()
+    overall_ok, overall_fail = 0, 0
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(accept_downloads=True)
 
-        ok, fail = 0, 0
-        results: list[tuple[str, str, str]] = []
-        for i, img in enumerate(files, 1):
-            try:
-                log(f"[{i}/{len(files)}] {img.name}")
-                saved = await remove_one(context, img, out_dir, timeout_ms)
-                size_kb = saved.stat().st_size / 1024
-                log(f"  -> 已保存：{saved} ({size_kb:.1f} KB)")
-                ok += 1
-                results.append((img.name, "OK", str(saved)))
-            except Exception as e:
-                log(f"  !! 失败：{img.name} | {type(e).__name__}: {e}")
-                fail += 1
-                results.append((img.name, "FAIL", f"{type(e).__name__}: {e}"))
+        for subdir, imgs in groups:
+            folder_name = subdir.name
+            out_subdir = out_root / folder_name
+            out_subdir.mkdir(parents=True, exist_ok=True)
+
+            folder_start = time.perf_counter()
+            folder_ok, folder_fail = 0, 0
+
+            next_idx = get_next_index(out_subdir, folder_name)
+
+            log(f"\n[文件夹] {folder_name} | 图片数={len(imgs)} | 输出目录={out_subdir}")
+            for i, img in enumerate(imgs, 1):
+                try:
+                    while True:
+                        final_name = f"{folder_name}{next_idx:03d}.jpg"
+                        final_path = out_subdir / final_name
+                        if not final_path.exists():
+                            break
+                        next_idx += 1
+
+                    log(f"[{i}/{len(imgs)}] {img.name} -> {final_name}")
+                    await remove_one(context, img, final_path, timeout_ms)
+                    folder_ok += 1
+                    overall_ok += 1
+                    next_idx += 1
+                except Exception as e:
+                    log(f"  !! 失败：{img.name} | {type(e).__name__}: {e}")
+                    folder_fail += 1
+                    overall_fail += 1
+
+            folder_elapsed = time.perf_counter() - folder_start
+            log(
+                f"[文件夹完成] {folder_name} | 总数={len(imgs)} 成功={folder_ok} 失败={folder_fail} "
+                f"| 耗时={folder_elapsed:.2f}s"
+            )
 
         await context.close()
         await browser.close()
 
-    log(f"完成。成功={ok}，失败={fail}")
-    log("逐文件结果：")
-    for name, status, detail in results:
-        log(f"  [{status}] {name} -> {detail}")
+    overall_elapsed = time.perf_counter() - overall_start
+    log("\n================ 汇总 ================")
+    log(f"文件夹总数：{len(groups)}")
+    log(f"图片总数：{total_images}")
+    log(f"成功：{overall_ok}，失败：{overall_fail}")
+    log(f"本次所有图片总耗时：{overall_elapsed:.2f}s")
 
 
 if __name__ == "__main__":
