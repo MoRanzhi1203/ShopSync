@@ -9,8 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from PIL import Image
-from PyQt5.QtCore import QSize, Qt
+from PIL import Image, ImageOps
+from PyQt5.QtCore import QObject, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QIcon, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -35,6 +35,7 @@ from PyQt5.QtWidgets import (
     QWidget,
     QComboBox,
     QSlider,
+    QStyle,
 )
 
 
@@ -50,6 +51,46 @@ class WatermarkConfig:
     scale_pct: int = 25
     rotate_deg: int = 0
     opacity_pct: int = 100
+
+
+class ThumbnailWorker(QObject):
+    thumbnail_ready = pyqtSignal(int, QIcon)
+    finished = pyqtSignal()
+
+    def __init__(self, files: List[Path], thumb_w: int = 200, thumb_h: int = 120) -> None:
+        super().__init__()
+        self.files = files
+        self.thumb_w = thumb_w
+        self.thumb_h = thumb_h
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        try:
+            for row, path in enumerate(self.files):
+                if self._stop:
+                    break
+                try:
+                    with Image.open(path) as im:
+                        rgb = im.convert("RGB")
+                        # Keep original aspect ratio (no crop), pad remaining space.
+                        fitted = ImageOps.contain(
+                            rgb,
+                            (self.thumb_w, self.thumb_h),
+                            method=Image.Resampling.LANCZOS,
+                        )
+                        canvas = Image.new("RGB", (self.thumb_w, self.thumb_h), (245, 245, 245))
+                        x = (self.thumb_w - fitted.width) // 2
+                        y = (self.thumb_h - fitted.height) // 2
+                        canvas.paste(fitted, (x, y))
+                    pix = pil_to_qpixmap(canvas)
+                    self.thumbnail_ready.emit(row, QIcon(pix))
+                except Exception:
+                    self.thumbnail_ready.emit(row, QIcon())
+        finally:
+            self.finished.emit()
 
 
 def ensure_dir(path: Path) -> None:
@@ -174,6 +215,12 @@ class MainWindow(QMainWindow):
         self.md5_index: Dict[str, str] = load_json(self.index_path, {})
         self.candidate_images: List[Path] = []
         self.current_internal_group_dir: Optional[Path] = None
+        self._pending_group_dir: Optional[Path] = None
+        self._thumb_worker_thread: Optional[QThread] = None
+        self._thumb_worker: Optional[ThumbnailWorker] = None
+        self._group_switch_timer = QTimer(self)
+        self._group_switch_timer.setSingleShot(True)
+        self._group_switch_timer.timeout.connect(self._apply_pending_group_change)
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -273,6 +320,7 @@ class MainWindow(QMainWindow):
         self.refresh_internal_group_list()
 
     def refresh_internal_group_list(self) -> None:
+        self._stop_thumbnail_worker()
         self.internal_group_list.clear()
         self.internal_group_file_list.clear()
         self.current_internal_group_dir = None
@@ -290,8 +338,10 @@ class MainWindow(QMainWindow):
 
     def on_internal_group_changed(self, current: Optional[QListWidgetItem], previous: Optional[QListWidgetItem]) -> None:
         _ = previous
+        self._stop_thumbnail_worker()
         self.internal_group_file_list.clear()
         self.current_internal_group_dir = None
+        self._pending_group_dir = None
         if current is None:
             return
         raw = current.data(Qt.UserRole)
@@ -300,6 +350,15 @@ class MainWindow(QMainWindow):
         group_dir = Path(str(raw))
         if not group_dir.exists() or not group_dir.is_dir():
             return
+        self._pending_group_dir = group_dir
+        # Debounce rapid clicks and only render the latest selected group.
+        self._group_switch_timer.start(80)
+
+    def _apply_pending_group_change(self) -> None:
+        group_dir = self._pending_group_dir
+        self._pending_group_dir = None
+        if group_dir is None or not group_dir.exists() or not group_dir.is_dir():
+            return
         self.current_internal_group_dir = group_dir
         self.populate_internal_group_files(group_dir)
 
@@ -307,14 +366,62 @@ class MainWindow(QMainWindow):
         if self.current_internal_group_dir and self.current_internal_group_dir.exists():
             self.populate_internal_group_files(self.current_internal_group_dir)
 
-    def _make_thumbnail_icon(self, path: Path, size: int = 128) -> QIcon:
-        pix = QPixmap(str(path))
-        if pix.isNull():
-            return QIcon()
-        pix = pix.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        return QIcon(pix)
+    def _stop_thumbnail_worker(self) -> None:
+        worker = self._thumb_worker
+        thread = self._thumb_worker_thread
+        self._thumb_worker = None
+        self._thumb_worker_thread = None
+
+        if worker is not None:
+            try:
+                worker.thumbnail_ready.disconnect(self._on_thumbnail_ready)
+            except Exception:
+                pass
+            try:
+                worker.stop()
+            except Exception:
+                pass
+
+        if thread is not None:
+            try:
+                thread.quit()
+            except Exception:
+                pass
+            try:
+                thread.wait(300)
+            except Exception:
+                pass
+
+    def _start_thumbnail_worker(self, files: List[Path]) -> None:
+        self._stop_thumbnail_worker()
+        thread = QThread(self)
+        worker = ThumbnailWorker(files, thumb_w=200, thumb_h=120)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.thumbnail_ready.connect(self._on_thumbnail_ready)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        self._thumb_worker_thread = thread
+        self._thumb_worker = worker
+
+    def _on_thumbnail_ready(self, row: int, icon: QIcon) -> None:
+        # Ignore stale signals from workers that are no longer current.
+        if self.sender() is not self._thumb_worker:
+            return
+        if self.internal_file_view_mode.currentText() != "大图标":
+            return
+        if row < 0 or row >= self.internal_group_file_list.count():
+            return
+        item = self.internal_group_file_list.item(row)
+        if item is None:
+            return
+        if not icon.isNull():
+            item.setIcon(icon)
 
     def populate_internal_group_files(self, group_dir: Path) -> None:
+        self._stop_thumbnail_worker()
         self.internal_group_file_list.setUpdatesEnabled(False)
         self.internal_group_file_list.clear()
         mode = self.internal_file_view_mode.currentText()
@@ -322,18 +429,25 @@ class MainWindow(QMainWindow):
 
         if mode == "大图标":
             self.internal_group_file_list.setViewMode(QListView.IconMode)
-            self.internal_group_file_list.setIconSize(QSize(128, 128))
-            self.internal_group_file_list.setGridSize(QSize(170, 180))
+            self.internal_group_file_list.setIconSize(QSize(200, 120))
+            self.internal_group_file_list.setGridSize(QSize(220, 165))
             self.internal_group_file_list.setResizeMode(QListView.Adjust)
             self.internal_group_file_list.setMovement(QListView.Static)
             self.internal_group_file_list.setWordWrap(True)
-            self.internal_group_file_list.setSpacing(8)
+            self.internal_group_file_list.setSpacing(10)
+            self.internal_group_file_list.setTextElideMode(Qt.ElideRight)
+            self.internal_group_file_list.setWrapping(True)
+            self.internal_group_file_list.setFlow(QListView.LeftToRight)
+            self.internal_group_file_list.setUniformItemSizes(False)
+            placeholder = self.style().standardIcon(QStyle.SP_FileIcon)
 
             for p in files:
-                it = QListWidgetItem(self._make_thumbnail_icon(p, 128), p.name)
+                it = QListWidgetItem(placeholder, p.name)
+                it.setTextAlignment(Qt.AlignHCenter)
                 it.setData(Qt.UserRole, str(p))
                 self.internal_group_file_list.addItem(it)
             self.internal_group_file_list.setUpdatesEnabled(True)
+            self._start_thumbnail_worker(files)
             return
 
         self.internal_group_file_list.setViewMode(QListView.ListMode)
@@ -342,16 +456,23 @@ class MainWindow(QMainWindow):
         self.internal_group_file_list.setMovement(QListView.Static)
         self.internal_group_file_list.setWordWrap(False)
         self.internal_group_file_list.setSpacing(2)
+        self.internal_group_file_list.setUniformItemSizes(True)
+        file_icon = self.style().standardIcon(QStyle.SP_FileIcon)
 
         for p in files:
             st = p.stat()
             size_kb = st.st_size / 1024
             mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
             text = f"{p.name}    {size_kb:.1f} KB    {mtime}"
-            it = QListWidgetItem(self._make_thumbnail_icon(p, 24), text)
+            it = QListWidgetItem(file_icon, text)
             it.setData(Qt.UserRole, str(p))
             self.internal_group_file_list.addItem(it)
         self.internal_group_file_list.setUpdatesEnabled(True)
+
+    def closeEvent(self, event) -> None:
+        self._group_switch_timer.stop()
+        self._stop_thumbnail_worker()
+        super().closeEvent(event)
 
     def import_to_internal_library(self) -> None:
         src_root = Path(self.src_import_line.text().strip())
