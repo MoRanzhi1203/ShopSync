@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import QSize, Qt
+from PyQt5.QtGui import QIcon, QImage, QPixmap
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QApplication,
+    QListView,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -171,6 +173,7 @@ class MainWindow(QMainWindow):
 
         self.md5_index: Dict[str, str] = load_json(self.index_path, {})
         self.candidate_images: List[Path] = []
+        self.current_internal_group_dir: Optional[Path] = None
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -223,36 +226,132 @@ class MainWindow(QMainWindow):
         btn.clicked.connect(self.import_to_internal_library)
         layout.addWidget(btn)
 
-        split = QHBoxLayout()
+        group_row = QHBoxLayout()
         left_col = QVBoxLayout()
         left_col.addWidget(QLabel("当前分组"))
         self.internal_group_list = QListWidget()
+        self.internal_group_list.currentItemChanged.connect(self.on_internal_group_changed)
+        self.internal_group_list.setMinimumHeight(420)
         left_col.addWidget(self.internal_group_list)
         left_wrap = QWidget()
         left_wrap.setLayout(left_col)
-        split.addWidget(left_wrap, 1)
+        group_row.addWidget(left_wrap, 1)
 
-        right_col = QVBoxLayout()
-        right_col.addWidget(QLabel("日志输出"))
+        mid_col = QVBoxLayout()
+        mid_col.addWidget(QLabel("分组文件"))
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("显示模式"))
+        self.internal_file_view_mode = QComboBox()
+        self.internal_file_view_mode.addItems(["详细信息", "大图标"])
+        self.internal_file_view_mode.currentIndexChanged.connect(self.on_internal_file_view_mode_changed)
+        mode_row.addWidget(self.internal_file_view_mode)
+        mode_row.addStretch(1)
+        mode_wrap = QWidget()
+        mode_wrap.setLayout(mode_row)
+        mid_col.addWidget(mode_wrap)
+        self.internal_group_file_list = QListWidget()
+        self.internal_group_file_list.setMinimumHeight(420)
+        self.internal_group_file_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.internal_group_file_list.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.internal_group_file_list.setUniformItemSizes(True)
+        self.internal_group_file_list.verticalScrollBar().setSingleStep(12)
+        mid_col.addWidget(self.internal_group_file_list)
+        mid_wrap = QWidget()
+        mid_wrap.setLayout(mid_col)
+        group_row.addWidget(mid_wrap, 2)
+
+        layout.addLayout(group_row, 1)
+
+        log_row = QVBoxLayout()
+        log_row.addWidget(QLabel("日志输出"))
         self.import_log = QTextEdit()
         self.import_log.setReadOnly(True)
-        right_col.addWidget(self.import_log)
-        right_wrap = QWidget()
-        right_wrap.setLayout(right_col)
-        split.addWidget(right_wrap, 2)
-        layout.addLayout(split)
+        self.import_log.setMaximumHeight(150)
+        log_row.addWidget(self.import_log)
+        layout.addLayout(log_row, 0)
 
         self.refresh_internal_group_list()
 
     def refresh_internal_group_list(self) -> None:
         self.internal_group_list.clear()
+        self.internal_group_file_list.clear()
+        self.current_internal_group_dir = None
         if not self.internal_root.exists():
             return
         for d in sorted(self.internal_root.iterdir()):
             if not d.is_dir():
                 continue
             cnt = len([p for p in d.iterdir() if is_image_file(p)])
-            self.internal_group_list.addItem(f"{d.name} ({cnt} 张)")
+            it = QListWidgetItem(f"{d.name} ({cnt} 张)")
+            it.setData(Qt.UserRole, str(d))
+            self.internal_group_list.addItem(it)
+        if self.internal_group_list.count() > 0:
+            self.internal_group_list.setCurrentRow(0)
+
+    def on_internal_group_changed(self, current: Optional[QListWidgetItem], previous: Optional[QListWidgetItem]) -> None:
+        _ = previous
+        self.internal_group_file_list.clear()
+        self.current_internal_group_dir = None
+        if current is None:
+            return
+        raw = current.data(Qt.UserRole)
+        if not raw:
+            return
+        group_dir = Path(str(raw))
+        if not group_dir.exists() or not group_dir.is_dir():
+            return
+        self.current_internal_group_dir = group_dir
+        self.populate_internal_group_files(group_dir)
+
+    def on_internal_file_view_mode_changed(self, _idx: int) -> None:
+        if self.current_internal_group_dir and self.current_internal_group_dir.exists():
+            self.populate_internal_group_files(self.current_internal_group_dir)
+
+    def _make_thumbnail_icon(self, path: Path, size: int = 128) -> QIcon:
+        pix = QPixmap(str(path))
+        if pix.isNull():
+            return QIcon()
+        pix = pix.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        return QIcon(pix)
+
+    def populate_internal_group_files(self, group_dir: Path) -> None:
+        self.internal_group_file_list.setUpdatesEnabled(False)
+        self.internal_group_file_list.clear()
+        mode = self.internal_file_view_mode.currentText()
+        files = [p for p in sorted(group_dir.iterdir()) if is_image_file(p)]
+
+        if mode == "大图标":
+            self.internal_group_file_list.setViewMode(QListView.IconMode)
+            self.internal_group_file_list.setIconSize(QSize(128, 128))
+            self.internal_group_file_list.setGridSize(QSize(170, 180))
+            self.internal_group_file_list.setResizeMode(QListView.Adjust)
+            self.internal_group_file_list.setMovement(QListView.Static)
+            self.internal_group_file_list.setWordWrap(True)
+            self.internal_group_file_list.setSpacing(8)
+
+            for p in files:
+                it = QListWidgetItem(self._make_thumbnail_icon(p, 128), p.name)
+                it.setData(Qt.UserRole, str(p))
+                self.internal_group_file_list.addItem(it)
+            self.internal_group_file_list.setUpdatesEnabled(True)
+            return
+
+        self.internal_group_file_list.setViewMode(QListView.ListMode)
+        self.internal_group_file_list.setIconSize(QSize(24, 24))
+        self.internal_group_file_list.setGridSize(QSize())
+        self.internal_group_file_list.setMovement(QListView.Static)
+        self.internal_group_file_list.setWordWrap(False)
+        self.internal_group_file_list.setSpacing(2)
+
+        for p in files:
+            st = p.stat()
+            size_kb = st.st_size / 1024
+            mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+            text = f"{p.name}    {size_kb:.1f} KB    {mtime}"
+            it = QListWidgetItem(self._make_thumbnail_icon(p, 24), text)
+            it.setData(Qt.UserRole, str(p))
+            self.internal_group_file_list.addItem(it)
+        self.internal_group_file_list.setUpdatesEnabled(True)
 
     def import_to_internal_library(self) -> None:
         src_root = Path(self.src_import_line.text().strip())
