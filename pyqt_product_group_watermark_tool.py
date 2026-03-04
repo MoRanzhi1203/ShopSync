@@ -645,6 +645,7 @@ class MainWindow(QMainWindow):
         self._wm_sim_cache_img: Optional[Image.Image] = None
         self._wm_preview_pix_cache_key: Optional[Tuple[object, ...]] = None
         self._wm_preview_pix_cache_img: Optional[QPixmap] = None
+        self._wm_preview_pix_cache_bbox_norm: Optional[Tuple[float, float, float, float]] = None
         self._preview_sliders: List[QSpinBox] = []
         self._wm_actual_border_norm: Optional[Tuple[float, float, float, float]] = None
         self._wm_current_border_norm: Optional[Tuple[float, float, float, float]] = None
@@ -1521,7 +1522,7 @@ class MainWindow(QMainWindow):
 
     def _build_wm_tab(self) -> None:
         layout = QHBoxLayout(self.wm_tab)
-        self.default_preview_image = self.root / "榛樿棰勮搴曞浘.jpg"
+        self.default_preview_image = self.root / "默认预览底图.jpg"
 
         left_col = QVBoxLayout()
         right_col = QVBoxLayout()
@@ -1560,8 +1561,10 @@ class MainWindow(QMainWindow):
 
         setting_box = QGroupBox("水印设置")
         setting_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        setting_box.setFixedHeight(275)
+        setting_box.setFixedHeight(210)
         setting_layout = QGridLayout(setting_box)
+        setting_layout.setHorizontalSpacing(8)
+        setting_layout.setVerticalSpacing(8)
 
         self.wm_selector = QComboBox()
         self.wm_selector.setIconSize(QSize(44, 44))
@@ -1572,32 +1575,29 @@ class MainWindow(QMainWindow):
         self.wm_selector.setItemDelegate(WatermarkComboDelegate(self.wm_selector))
         self.wm_selector.currentIndexChanged.connect(self._on_wm_selector_changed)
 
-        self.wm_x_slider = self._make_slider(0, 100, 50, self.update_preview)
-        self.wm_y_slider = self._make_slider(0, 100, 50, self.update_preview)
-        self.wm_scale_slider = self._make_slider(10, 200, 100, self.update_preview)
         self.wm_rotate_slider = self._make_slider(-180, 180, 0, self.update_preview)
         self.wm_opacity_slider = self._make_slider(1, 100, 100, self.update_preview)
         self.show_border_checkbox = QCheckBox("显示边框")
         self.show_border_checkbox.setChecked(False)
         self.show_border_checkbox.toggled.connect(self.update_preview)
-        self.manual_border_checkbox = QCheckBox("手动调整边框")
-        self.manual_border_checkbox.setChecked(False)
-        self.manual_border_checkbox.toggled.connect(self._on_manual_border_toggled)
+        row_h = self.wm_rotate_slider.sizeHint().height()
+        self.wm_selector.setFixedHeight(row_h)
+        self.show_border_checkbox.setFixedHeight(row_h)
+
+        wm_pick_row = QHBoxLayout()
+        self._normalize_row_spacing(wm_pick_row)
+        wm_pick_row.addWidget(self.wm_selector, 1)
+        wm_pick_row.addWidget(self.show_border_checkbox, 0, Qt.AlignVCenter)
+        wm_pick_wrap = QWidget()
+        wm_pick_wrap.setLayout(wm_pick_row)
+        wm_pick_wrap.setFixedHeight(row_h)
 
         setting_layout.addWidget(QLabel("选择水印"), 0, 0)
-        setting_layout.addWidget(self.wm_selector, 0, 1, 1, 3)
-        setting_layout.addWidget(self.show_border_checkbox, 1, 1)
-        setting_layout.addWidget(self.manual_border_checkbox, 1, 2, 1, 2)
-        setting_layout.addWidget(QLabel("水平位置(X%)"), 2, 0)
-        setting_layout.addWidget(self.wm_x_slider, 2, 1, 1, 3)
-        setting_layout.addWidget(QLabel("垂直位置(Y%)"), 3, 0)
-        setting_layout.addWidget(self.wm_y_slider, 3, 1, 1, 3)
-        setting_layout.addWidget(QLabel("缩放(%)"), 4, 0)
-        setting_layout.addWidget(self.wm_scale_slider, 4, 1, 1, 3)
-        setting_layout.addWidget(QLabel("旋转(度)"), 5, 0)
-        setting_layout.addWidget(self.wm_rotate_slider, 5, 1, 1, 3)
-        setting_layout.addWidget(QLabel("透明度(%)"), 6, 0)
-        setting_layout.addWidget(self.wm_opacity_slider, 6, 1, 1, 3)
+        setting_layout.addWidget(wm_pick_wrap, 0, 1, 1, 3)
+        setting_layout.addWidget(QLabel("旋转(度)"), 1, 0)
+        setting_layout.addWidget(self.wm_rotate_slider, 1, 1, 1, 3)
+        setting_layout.addWidget(QLabel("透明度(%)"), 2, 0)
+        setting_layout.addWidget(self.wm_opacity_slider, 2, 1, 1, 3)
 
         btn_apply = QPushButton("应用")
         btn_apply.clicked.connect(self.apply_wm_settings)
@@ -1605,9 +1605,9 @@ class MainWindow(QMainWindow):
         btn_reset.clicked.connect(self.reset_wm_settings)
         btn_delete = QPushButton("删除")
         btn_delete.clicked.connect(self.delete_selected_watermark)
-        setting_layout.addWidget(btn_apply, 7, 1)
-        setting_layout.addWidget(btn_reset, 7, 2)
-        setting_layout.addWidget(btn_delete, 7, 3)
+        setting_layout.addWidget(btn_apply, 3, 1)
+        setting_layout.addWidget(btn_reset, 3, 2)
+        setting_layout.addWidget(btn_delete, 3, 3)
         left_col.addWidget(setting_box)
 
         cfg_box = QGroupBox("配置设置")
@@ -1622,9 +1622,6 @@ class MainWindow(QMainWindow):
         self.final_rotate_slider = self._make_slider(-180, 180, 0, self.update_preview)
         self.final_opacity_slider = self._make_slider(1, 100, 100, self.update_preview)
         self._preview_sliders = [
-            self.wm_x_slider,
-            self.wm_y_slider,
-            self.wm_scale_slider,
             self.wm_rotate_slider,
             self.wm_opacity_slider,
             self.final_x_slider,
@@ -1690,8 +1687,6 @@ class MainWindow(QMainWindow):
         self.current_wm_preview.setMinimumHeight(120)
         self.current_wm_preview.setMaximumHeight(120)
         self.current_wm_preview.setStyleSheet("border: 1px solid #999;")
-        self.current_wm_preview.borderChanged.connect(self._on_wm_border_changed)
-        self.preview_label.borderChanged.connect(self._on_fx_border_changed)
         self.current_wm_name = QLabel("当前水印名称")
         self.current_wm_name.setAlignment(Qt.AlignCenter)
         self.current_wm_name.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
@@ -1755,9 +1750,6 @@ class MainWindow(QMainWindow):
         feature_reset_wm_settings(self)
 
     def _reset_wm_setting_sliders(self) -> None:
-        self.wm_x_slider.setValue(50)
-        self.wm_y_slider.setValue(50)
-        self.wm_scale_slider.setValue(100)
         self.wm_rotate_slider.setValue(0)
         self.wm_opacity_slider.setValue(100)
 
@@ -1829,30 +1821,13 @@ class MainWindow(QMainWindow):
     def _apply_watermark_image_settings(self, wm_img: Image.Image, fast_mode: bool = False) -> Image.Image:
         # Watermark settings: process the watermark image itself.
         mark = wm_img.convert("RGBA")
-        resize_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.LANCZOS
         rotate_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.BICUBIC
-        scale_pct = max(1, self.wm_scale_slider.value())
-        nw = max(2, int(mark.width * scale_pct / 100))
-        nh = max(2, int(mark.height * scale_pct / 100))
-        mark = mark.resize((nw, nh), resize_resample)
         mark = mark.rotate(self.wm_rotate_slider.value(), expand=True, resample=rotate_resample)
 
         op = self.wm_opacity_slider.value()
         if op < 100:
             alpha = mark.getchannel("A").point(lambda x: int(x * op / 100))
             mark.putalpha(alpha)
-
-        # Apply X/Y movement on watermark image canvas.
-        dx = int((self.wm_x_slider.value() - 50) / 50.0 * mark.width * 0.5)
-        dy = int((self.wm_y_slider.value() - 50) / 50.0 * mark.height * 0.5)
-        if dx != 0 or dy != 0:
-            cw = mark.width + abs(dx)
-            ch = mark.height + abs(dy)
-            canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-            px = max(dx, 0)
-            py = max(dy, 0)
-            canvas.paste(mark, (px, py), mark)
-            mark = canvas
         return mark
 
     def _compose_effect_preview(
@@ -1903,9 +1878,6 @@ class MainWindow(QMainWindow):
         key = (
             str(wm_path),
             st.st_mtime,
-            self.wm_x_slider.value(),
-            self.wm_y_slider.value(),
-            self.wm_scale_slider.value(),
             self.wm_rotate_slider.value(),
             self.wm_opacity_slider.value(),
             fast_mode,
@@ -1918,17 +1890,65 @@ class MainWindow(QMainWindow):
         self._wm_sim_cache_img = wm_processed
         return wm_processed.copy()
 
-    def _get_cached_wm_preview_pix(self, wm_processed: Image.Image, target_w: int, target_h: int) -> QPixmap:
+    def _get_cached_wm_preview_pix(
+        self,
+        wm_processed: Image.Image,
+        target_w: int,
+        target_h: int,
+    ) -> Tuple[QPixmap, Tuple[float, float, float, float]]:
         key = (self._wm_sim_cache_key, target_w, target_h)
-        if self._wm_preview_pix_cache_key == key and self._wm_preview_pix_cache_img is not None:
-            return QPixmap(self._wm_preview_pix_cache_img)
-        wm_thumb = pil_to_qpixmap(wm_processed)
-        if wm_thumb.isNull():
-            return QPixmap()
-        wm_thumb = self._render_checkerboard_preview(wm_thumb, target_w, target_h)
+        if (
+            self._wm_preview_pix_cache_key == key
+            and self._wm_preview_pix_cache_img is not None
+            and self._wm_preview_pix_cache_bbox_norm is not None
+        ):
+            return QPixmap(self._wm_preview_pix_cache_img), self._wm_preview_pix_cache_bbox_norm
+
+        w = max(1, target_w)
+        h = max(1, target_h)
+        padding = 2
+        wm_thumb_src = pil_to_qpixmap(wm_processed)
+        if wm_thumb_src.isNull():
+            return QPixmap(), (0.0, 0.0, 1.0, 1.0)
+
+        canvas = QPixmap(w, h)
+        canvas.fill(QColor(0, 0, 0, 0))
+        p = QPainter(canvas)
+        c1 = QColor(238, 238, 238)
+        c2 = QColor(212, 212, 212)
+        block = 10
+        for y in range(0, h, block):
+            for x in range(0, w, block):
+                p.fillRect(x, y, block, block, c1 if ((x // block + y // block) % 2 == 0) else c2)
+
+        avail_w = max(1, w - 2 * padding)
+        avail_h = max(1, h - 2 * padding)
+        draw = wm_thumb_src.scaled(avail_w, avail_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        dx = (w - draw.width()) // 2
+        dy = (h - draw.height()) // 2
+        p.drawPixmap(dx, dy, draw)
+        p.end()
+
+        rgba = wm_processed.convert("RGBA")
+        bbox = rgba.getchannel("A").getbbox()
+        if bbox and wm_processed.width > 0 and wm_processed.height > 0:
+            l, t, r, b = bbox
+            sx = draw.width() / float(wm_processed.width)
+            sy = draw.height() / float(wm_processed.height)
+            ax = dx + l * sx
+            ay = dy + t * sy
+            aw = max(1.0, (r - l) * sx)
+            ah = max(1.0, (b - t) * sy)
+            bbox_norm = self._clamp_norm_rect((ax / w, ay / h, aw / w, ah / h))
+        else:
+            bbox_norm = self._clamp_norm_rect(
+                (dx / float(w), dy / float(h), draw.width() / float(w), draw.height() / float(h))
+            )
+
         self._wm_preview_pix_cache_key = key
-        self._wm_preview_pix_cache_img = QPixmap(wm_thumb)
-        return wm_thumb
+        self._wm_preview_pix_cache_img = QPixmap(canvas)
+        self._wm_preview_pix_cache_bbox_norm = bbox_norm
+        return canvas, bbox_norm
 
     @staticmethod
     def _clamp_norm_rect(rect: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
@@ -1950,31 +1970,18 @@ class MainWindow(QMainWindow):
         return self._clamp_norm_rect((l / w, t / h, (r - l) / w, (b - t) / h))
 
     def _on_wm_border_changed(self, rect_norm) -> None:
-        if not self.manual_border_checkbox.isChecked():
-            return
-        if isinstance(rect_norm, tuple) and len(rect_norm) == 4:
-            self._wm_current_border_norm = self._clamp_norm_rect(rect_norm)
-            self._wm_border_user_modified = True
+        _ = rect_norm
+        return
 
     def _on_fx_border_changed(self, rect_norm) -> None:
-        if not self.manual_border_checkbox.isChecked():
-            return
-        if isinstance(rect_norm, tuple) and len(rect_norm) == 4:
-            self._fx_current_border_norm = self._clamp_norm_rect(rect_norm)
-            self._fx_border_user_modified = True
+        _ = rect_norm
+        return
 
     def _on_manual_border_toggled(self, _checked: bool) -> None:
-        # Re-initialize current frame from actual frame when mode changes.
-        self._wm_border_user_modified = False
-        self._fx_border_user_modified = False
-        self._wm_current_border_norm = None
-        self._fx_current_border_norm = None
         self.update_preview()
 
     def _on_wm_selector_changed(self, _idx: int) -> None:
         # New watermark should start with current frame aligned to actual frame.
-        self._wm_border_user_modified = False
-        self._fx_border_user_modified = False
         self._wm_current_border_norm = None
         self._fx_current_border_norm = None
         self.update_preview()
@@ -2017,7 +2024,6 @@ class MainWindow(QMainWindow):
             base_preview = self._get_cached_sample_preview(sample_path, tw, th)
             effect_preview = base_preview.convert("RGBA")
             show_frames = self.show_border_checkbox.isChecked()
-            manual_mode = self.manual_border_checkbox.isChecked()
             self._wm_actual_border_norm = None
             self._fx_actual_border_norm = None
 
@@ -2026,14 +2032,13 @@ class MainWindow(QMainWindow):
             wm_path = self.watermark_root / wm_name if wm_name else None
             if wm_path is not None and wm_path.exists():
                 wm_processed = self._get_cached_simulated_wm(wm_path, fast_mode=fast_mode)
-                self._wm_actual_border_norm = self._alpha_bbox_norm(wm_processed)
-                if (not manual_mode) or (not self._wm_border_user_modified) or (self._wm_current_border_norm is None):
-                    self._wm_current_border_norm = self._wm_actual_border_norm
-                wm_thumb = self._get_cached_wm_preview_pix(
+                wm_thumb, wm_preview_bbox_norm = self._get_cached_wm_preview_pix(
                     wm_processed,
                     max(1, self.current_wm_preview.width() - 2),
                     max(1, self.current_wm_preview.height() - 2),
                 )
+                self._wm_actual_border_norm = wm_preview_bbox_norm
+                self._wm_current_border_norm = self._wm_actual_border_norm
                 if not wm_thumb.isNull():
                     self.current_wm_preview.setPixmap(wm_thumb)
                     self.current_wm_preview.setText("")
@@ -2047,8 +2052,7 @@ class MainWindow(QMainWindow):
                     wm_processed,
                     fast_mode=fast_mode,
                 )
-                if (not manual_mode) or (not self._fx_border_user_modified) or (self._fx_current_border_norm is None):
-                    self._fx_current_border_norm = self._fx_actual_border_norm
+                self._fx_current_border_norm = self._fx_actual_border_norm
             else:
                 empty = self._render_checkerboard_preview(QPixmap(), max(1, self.current_wm_preview.width() - 2), max(1, self.current_wm_preview.height() - 2))
                 self.current_wm_preview.setPixmap(empty)
@@ -2056,8 +2060,6 @@ class MainWindow(QMainWindow):
                 self.current_wm_name.setText("当前水印名称")
                 self._wm_current_border_norm = None
                 self._fx_current_border_norm = None
-                self._wm_border_user_modified = False
-                self._fx_border_user_modified = False
 
             pix = pil_to_qpixmap(effect_preview)
             # Always fit the whole image into preview area without crop.
@@ -2072,13 +2074,13 @@ class MainWindow(QMainWindow):
                 self._wm_actual_border_norm,
                 self._wm_current_border_norm,
                 show_frames,
-                manual_mode,
+                False,
             )
             self.preview_label.set_overlay_rects(
                 self._fx_actual_border_norm,
                 self._fx_current_border_norm,
                 show_frames,
-                manual_mode,
+                False,
             )
         except Exception as e:
             self.preview_label.setText(f"预览错误: {type(e).__name__}: {e}")
