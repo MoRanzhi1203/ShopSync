@@ -83,9 +83,9 @@ class ThumbnailWorker(QObject):
     thumbnail_ready = pyqtSignal(int, QIcon)
     finished = pyqtSignal()
 
-    def __init__(self, files: List[Path], thumb_w: int = 176, thumb_h: int = 102) -> None:
+    def __init__(self, tasks: List[Tuple[int, Path]], thumb_w: int = 176, thumb_h: int = 102) -> None:
         super().__init__()
-        self.files = files
+        self.tasks = tasks
         self.thumb_w = thumb_w
         self.thumb_h = thumb_h
         self._stop = False
@@ -95,7 +95,7 @@ class ThumbnailWorker(QObject):
 
     def run(self) -> None:
         try:
-            for row, path in enumerate(self.files):
+            for row, path in self.tasks:
                 if self._stop:
                     break
                 try:
@@ -722,6 +722,11 @@ class MainWindow(QMainWindow):
         self.thumb_grid_h = 148
         self._thumb_worker_thread: Optional[QThread] = None
         self._thumb_worker: Optional[ThumbnailWorker] = None
+        self._thumb_files: List[Path] = []
+        self._thumb_loaded_rows: set[int] = set()
+        self._thumb_schedule_timer = QTimer(self)
+        self._thumb_schedule_timer.setSingleShot(True)
+        self._thumb_schedule_timer.timeout.connect(self._schedule_thumbnail_loading)
         self._group_switch_timer = QTimer(self)
         self._group_switch_timer.setSingleShot(True)
         self._group_switch_timer.timeout.connect(self._apply_pending_group_change)
@@ -829,7 +834,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(self.import_tab)
 
         form = QFormLayout()
-        self.src_import_line = QLineEdit(str(self.root / "input_images"))
+        self.src_import_line = QLineEdit("")
         pick_btn = QPushButton("选择导入文件夹")
         pick_btn.clicked.connect(lambda: self._pick_dir(self.src_import_line))
         row = QHBoxLayout()
@@ -874,21 +879,32 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.internal_file_view_mode.setCurrentIndex(idx)
         mode_row.addWidget(self.internal_file_view_mode)
+        row_h = self.internal_file_view_mode.sizeHint().height()
+        self.internal_file_view_mode.setFixedHeight(row_h)
+        mode_row.addStretch(1)
         self.btn_file_select_all = QPushButton("全选")
         self.btn_file_select_all.clicked.connect(self.select_all_files)
+        self.btn_file_select_all.setFixedHeight(row_h)
         mode_row.addWidget(self.btn_file_select_all)
         self.btn_file_select_none = QPushButton("取消选择")
         self.btn_file_select_none.clicked.connect(self.clear_file_selection)
+        self.btn_file_select_none.setFixedHeight(row_h)
         mode_row.addWidget(self.btn_file_select_none)
         self.btn_batch_move = QPushButton("移动到其他分组")
         self.btn_batch_move.clicked.connect(self.batch_move_files)
+        self.btn_batch_move.setFixedHeight(row_h)
         mode_row.addWidget(self.btn_batch_move)
         self.btn_batch_delete = QPushButton("删除")
         self.btn_batch_delete.clicked.connect(self.batch_delete_files)
+        self.btn_batch_delete.setFixedHeight(row_h)
         mode_row.addWidget(self.btn_batch_delete)
-        mode_row.addStretch(1)
+        self.btn_group_refresh = QPushButton("刷新")
+        self.btn_group_refresh.clicked.connect(self.refresh_internal_group_list)
+        self.btn_group_refresh.setFixedHeight(row_h)
+        mode_row.addWidget(self.btn_group_refresh)
         mode_wrap = QWidget()
         mode_wrap.setLayout(mode_row)
+        mode_wrap.setFixedHeight(row_h)
         mid_col.addWidget(mode_wrap)
         self.internal_group_file_list = QListWidget()
         self.internal_group_file_list.setMinimumHeight(420)
@@ -1475,6 +1491,7 @@ class MainWindow(QMainWindow):
             self.populate_internal_group_files(self.current_internal_group_dir)
 
     def _stop_thumbnail_worker(self) -> None:
+        self._thumb_schedule_timer.stop()
         worker = self._thumb_worker
         thread = self._thumb_worker_thread
         self._thumb_worker = None
@@ -1500,10 +1517,12 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-    def _start_thumbnail_worker(self, files: List[Path]) -> None:
+    def _start_thumbnail_worker(self, tasks: List[Tuple[int, Path]]) -> None:
+        if not tasks:
+            return
         self._stop_thumbnail_worker()
         thread = QThread(self)
-        worker = ThumbnailWorker(files, thumb_w=self.thumb_w, thumb_h=self.thumb_h)
+        worker = ThumbnailWorker(tasks, thumb_w=self.thumb_w, thumb_h=self.thumb_h)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.thumbnail_ready.connect(self._on_thumbnail_ready)
@@ -1513,6 +1532,61 @@ class MainWindow(QMainWindow):
         thread.start()
         self._thumb_worker_thread = thread
         self._thumb_worker = worker
+
+    def _visible_thumbnail_rows(self) -> List[int]:
+        view = self.internal_group_file_list
+        if view.count() <= 0:
+            return []
+        viewport = view.viewport().rect()
+        rows: List[int] = []
+        for row in range(view.count()):
+            it = view.item(row)
+            if it is None:
+                continue
+            r = view.visualItemRect(it)
+            if not r.isValid() or r.isEmpty():
+                continue
+            if r.intersects(viewport):
+                rows.append(row)
+        return rows
+
+    def _thumbnail_priority_rows(self, pending_rows: List[int]) -> List[int]:
+        if not pending_rows:
+            return []
+        pending_set = set(pending_rows)
+        visible = [r for r in self._visible_thumbnail_rows() if r in pending_set]
+        if not visible:
+            return sorted(pending_rows)
+        ordered: List[int] = []
+        ordered.extend(sorted(visible))
+        vmin = min(visible)
+        vmax = max(visible)
+        up = vmin - 1
+        down = vmax + 1
+        while up >= 0 or down < len(self._thumb_files):
+            if up >= 0 and up in pending_set:
+                ordered.append(up)
+            if down < len(self._thumb_files) and down in pending_set:
+                ordered.append(down)
+            up -= 1
+            down += 1
+        return ordered
+
+    def _schedule_thumbnail_loading(self) -> None:
+        if self.internal_file_view_mode.currentText() != "缩略图视图":
+            return
+        if not self._thumb_files:
+            return
+        pending_rows = [i for i in range(len(self._thumb_files)) if i not in self._thumb_loaded_rows]
+        if not pending_rows:
+            self._stop_thumbnail_worker()
+            return
+        priority_rows = self._thumbnail_priority_rows(pending_rows)
+        tasks = [(row, self._thumb_files[row]) for row in priority_rows]
+        self._start_thumbnail_worker(tasks)
+
+    def _on_thumbnail_viewport_changed(self, _value: int) -> None:
+        self._thumb_schedule_timer.start(80)
 
     def _on_thumbnail_ready(self, row: int, icon: QIcon) -> None:
         # Ignore stale signals from workers that are no longer current.
@@ -1527,9 +1601,16 @@ class MainWindow(QMainWindow):
             return
         if not icon.isNull():
             item.setIcon(icon)
+        self._thumb_loaded_rows.add(row)
 
     def populate_internal_group_files(self, group_dir: Path) -> None:
         self._stop_thumbnail_worker()
+        self._thumb_files = []
+        self._thumb_loaded_rows = set()
+        try:
+            self.internal_group_file_list.verticalScrollBar().valueChanged.disconnect(self._on_thumbnail_viewport_changed)
+        except Exception:
+            pass
         self.internal_group_file_list.setUpdatesEnabled(False)
         self.internal_group_file_list.clear()
         mode = self.internal_file_view_mode.currentText()
@@ -1555,7 +1636,10 @@ class MainWindow(QMainWindow):
                 it.setData(Qt.UserRole, str(p))
                 self.internal_group_file_list.addItem(it)
             self.internal_group_file_list.setUpdatesEnabled(True)
-            self._start_thumbnail_worker(files)
+            self._thumb_files = files
+            self.internal_group_file_list.verticalScrollBar().valueChanged.connect(self._on_thumbnail_viewport_changed)
+            QApplication.processEvents()
+            self._schedule_thumbnail_loading()
             return
 
         self.internal_group_file_list.setViewMode(QListView.ListMode)
