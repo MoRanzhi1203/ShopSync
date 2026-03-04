@@ -1710,7 +1710,7 @@ class MainWindow(QMainWindow):
 
         cfg_box = QGroupBox("配置设置")
         cfg_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        cfg_box.setFixedHeight(205)
+        cfg_box.setFixedHeight(330)
         cfg_layout = QGridLayout(cfg_box)
 
         self.cfg_name = QLineEdit("")
@@ -1719,6 +1719,8 @@ class MainWindow(QMainWindow):
         self.final_scale_slider = self._make_slider(5, 100, 25, self.update_preview)
         self.final_rotate_slider = self._make_slider(-999999, 999999, 0, self.update_preview)
         self.final_opacity_slider = self._make_slider(1, 100, 100, self.update_preview)
+        self.config_selector = QComboBox()
+        self.config_selector.currentIndexChanged.connect(self.load_selected_config)
         self._preview_sliders = [
             self.wm_rotate_slider,
             self.wm_opacity_slider,
@@ -1743,36 +1745,43 @@ class MainWindow(QMainWindow):
         cfg_layout.addWidget(self.final_rotate_slider, 4, 1, 1, 3)
         cfg_layout.addWidget(QLabel("透明度(%)"), 5, 0)
         cfg_layout.addWidget(self.final_opacity_slider, 5, 1, 1, 3)
+        cfg_layout.addWidget(QLabel("配置列表"), 6, 0)
+        cfg_layout.addWidget(self.config_selector, 6, 1, 1, 3)
 
-        left_col.addWidget(cfg_box)
+        cfg_btn_row = QHBoxLayout()
+        self._normalize_row_spacing(cfg_btn_row)
+        save_btn = QPushButton("保存配置")
+        save_btn.clicked.connect(self.save_current_config)
+        reset_cfg_btn = QPushButton("重置")
+        reset_cfg_btn.clicked.connect(self.reset_config_settings)
+        delete_cfg_btn = QPushButton("删除")
+        delete_cfg_btn.clicked.connect(self.delete_selected_config)
+        rename_cfg_btn = QPushButton("重命名")
+        rename_cfg_btn.clicked.connect(self.rename_selected_config)
+        cfg_btn_row.addWidget(save_btn)
+        cfg_btn_row.addWidget(reset_cfg_btn)
+        cfg_btn_row.addWidget(delete_cfg_btn)
+        cfg_btn_row.addWidget(rename_cfg_btn)
+        cfg_btn_wrap = QWidget()
+        cfg_btn_wrap.setLayout(cfg_btn_row)
+        cfg_layout.addWidget(cfg_btn_wrap, 7, 1, 1, 3)
 
         sample_row = QHBoxLayout()
         self._normalize_row_spacing(sample_row)
         self.sample_image_line = QLineEdit(str(self.default_preview_image))
         pick_sample = QPushButton("选择预览图片")
         pick_sample.clicked.connect(lambda: self._pick_file(self.sample_image_line, "Image Files (*.png *.jpg *.jpeg *.webp *.bmp)"))
-        sample_row.addWidget(self.sample_image_line)
+        export_preview_btn = QPushButton("导出预览图")
+        export_preview_btn.clicked.connect(self.export_composited_preview_image)
+        sample_row.addWidget(self.sample_image_line, 1)
         sample_row.addWidget(pick_sample)
-        sample_w = QWidget()
-        sample_w.setLayout(sample_row)
-        sample_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        sample_w.setFixedHeight(34)
-        left_col.addWidget(sample_w)
+        sample_row.addWidget(export_preview_btn)
+        sample_wrap = QWidget()
+        sample_wrap.setLayout(sample_row)
+        cfg_layout.addWidget(QLabel("预览图片"), 8, 0)
+        cfg_layout.addWidget(sample_wrap, 8, 1, 1, 3)
 
-        btn_row = QHBoxLayout()
-        self._normalize_row_spacing(btn_row)
-        self.config_selector = QComboBox()
-        self.config_selector.currentIndexChanged.connect(self.load_selected_config)
-        save_btn = QPushButton("保存配置")
-        save_btn.clicked.connect(self.save_current_config)
-        btn_row.addWidget(QLabel("配置列表"))
-        btn_row.addWidget(self.config_selector)
-        btn_row.addWidget(save_btn)
-        btn_w = QWidget()
-        btn_w.setLayout(btn_row)
-        btn_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        btn_w.setFixedHeight(34)
-        left_col.addWidget(btn_w)
+        left_col.addWidget(cfg_box)
 
         self.preview_label = OverlayPreviewLabel("预览效果")
         self.preview_label.setAlignment(Qt.AlignCenter)
@@ -2127,6 +2136,159 @@ class MainWindow(QMainWindow):
 
     def load_selected_config(self) -> None:
         feature_load_selected_config(self, load_json=load_json)
+
+    def reset_config_settings(self) -> None:
+        # Prefer restoring last saved values from selected config; fallback to defaults.
+        cfg_name = self.config_selector.currentText().strip() if hasattr(self, "config_selector") else ""
+        data = None
+        if cfg_name:
+            data = load_json(self.config_root / f"{cfg_name}.json", None)
+        if not data:
+            name_from_input = self.cfg_name.text().strip()
+            if name_from_input:
+                data = load_json(self.config_root / f"{name_from_input}.json", None)
+
+        if isinstance(data, dict):
+            self.cfg_name.setText(str(data.get("name", cfg_name or self.cfg_name.text().strip())))
+            wm_file = str(data.get("watermark_file", ""))
+            if wm_file:
+                for i in range(self.wm_selector.count()):
+                    if self.wm_selector.itemData(i) == wm_file:
+                        self.wm_selector.setCurrentIndex(i)
+                        break
+            self.final_x_slider.setValue(int(data.get("x_pct", 50)))
+            self.final_y_slider.setValue(int(data.get("y_pct", 50)))
+            self.final_scale_slider.setValue(int(data.get("scale_pct", 25)))
+            self.final_rotate_slider.setValue(int(data.get("rotate_deg", 0)))
+            self.final_opacity_slider.setValue(int(data.get("opacity_pct", 100)))
+        else:
+            self.final_x_slider.setValue(50)
+            self.final_y_slider.setValue(50)
+            self.final_scale_slider.setValue(25)
+            self.final_rotate_slider.setValue(0)
+            self.final_opacity_slider.setValue(100)
+        self.update_preview()
+
+    def delete_selected_config(self) -> None:
+        name = self.config_selector.currentText().strip()
+        if not name:
+            QMessageBox.information(self, "提示", "请先选择配置")
+            return
+        cfg_path = self.config_root / f"{name}.json"
+        if not cfg_path.exists():
+            QMessageBox.warning(self, "错误", "配置文件不存在")
+            return
+        ans = QMessageBox.question(
+            self,
+            "删除配置",
+            f"确认删除配置“{name}”吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            cfg_path.unlink()
+            self._log(self.wm_log, f"已删除配置: {name}")
+            self.refresh_watermark_lists()
+            self.refresh_export_config_list()
+        except Exception as e:
+            QMessageBox.critical(self, "删除失败", f"{type(e).__name__}: {e}")
+
+    def rename_selected_config(self) -> None:
+        old_name = self.config_selector.currentText().strip()
+        if not old_name:
+            QMessageBox.information(self, "提示", "请先选择配置")
+            return
+        new_name, ok = QInputDialog.getText(self, "重命名配置", "新配置名称：", text=old_name)
+        if not ok:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            QMessageBox.warning(self, "错误", "配置名称不能为空")
+            return
+        invalid = set('<>:"/\\|?*')
+        if any(ch in invalid for ch in new_name):
+            QMessageBox.warning(self, "错误", "配置名称包含非法字符")
+            return
+        if new_name == old_name:
+            return
+        old_path = self.config_root / f"{old_name}.json"
+        new_path = self.config_root / f"{new_name}.json"
+        if not old_path.exists():
+            QMessageBox.warning(self, "错误", "原配置文件不存在")
+            return
+        if new_path.exists():
+            QMessageBox.warning(self, "错误", f"目标配置已存在: {new_name}")
+            return
+        try:
+            data = load_json(old_path, {})
+            if isinstance(data, dict):
+                data["name"] = new_name
+                save_json(new_path, data)
+                old_path.unlink()
+            else:
+                old_path.rename(new_path)
+            self._log(self.wm_log, f"配置重命名: {old_name} -> {new_name}")
+            self.refresh_watermark_lists()
+            idx = self.config_selector.findText(new_name)
+            if idx >= 0:
+                self.config_selector.setCurrentIndex(idx)
+            self.refresh_export_config_list()
+        except Exception as e:
+            QMessageBox.critical(self, "重命名失败", f"{type(e).__name__}: {e}")
+
+    def export_composited_preview_image(self) -> None:
+        sample_path = Path(self.sample_image_line.text().strip()) if self.sample_image_line.text().strip() else self.default_preview_image
+        if not sample_path.exists() and self.default_preview_image.exists():
+            sample_path = self.default_preview_image
+            self.sample_image_line.setText(str(sample_path))
+        if not sample_path.exists():
+            QMessageBox.warning(self, "错误", "预览图片不存在")
+            return
+
+        out_path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出合成预览图",
+            str(self.export_root / f"preview_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"),
+            "JPEG Files (*.jpg *.jpeg);;PNG Files (*.png)",
+        )
+        if not out_path_str:
+            return
+        out_path = Path(out_path_str)
+
+        try:
+            with Image.open(sample_path) as s_im:
+                base = s_im.convert("RGB")
+
+            wm_name = self._selected_wm_filename()
+            if wm_name:
+                wm_path = self.watermark_root / wm_name
+                if wm_path.exists():
+                    wm_processed = self._get_cached_simulated_wm(wm_path, fast_mode=False)
+                    composed, _ = self._compose_effect_preview(
+                        base,
+                        wm_processed,
+                        fast_mode=False,
+                        use_alpha_bbox=False,
+                        final_rotate_override=None,
+                        constrain_bounds=(0, 0, base.width, base.height),
+                    )
+                else:
+                    composed = base.convert("RGBA")
+            else:
+                composed = base.convert("RGBA")
+
+            ensure_dir(out_path.parent)
+            if out_path.suffix.lower() == ".png":
+                composed.save(out_path, "PNG")
+            else:
+                if out_path.suffix.lower() not in {".jpg", ".jpeg"}:
+                    out_path = out_path.with_suffix(".jpg")
+                composed.convert("RGB").save(out_path, "JPEG", quality=95, optimize=True)
+            self._log(self.wm_log, f"已导出预览图: {out_path.name}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"{type(e).__name__}: {e}")
 
     def update_preview(self) -> None:
         if self._preview_rendering:

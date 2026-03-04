@@ -68,6 +68,11 @@ def apply_wm_settings(ctx) -> None:
         ctx._fx_current_border_norm = None
         ctx._reset_wm_setting_sliders()
         ctx.refresh_watermark_lists()
+        # Force-keep current watermark selection after list refresh.
+        for i in range(ctx.wm_selector.count()):
+            if ctx.wm_selector.itemData(i) == wm_file:
+                ctx.wm_selector.setCurrentIndex(i)
+                break
         ctx.update_preview()
         ctx._log(ctx.wm_log, f"已应用并覆盖水印: {wm_path.name}")
     except Exception as e:
