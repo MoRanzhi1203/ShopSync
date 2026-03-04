@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import hashlib
 import io
 import json
@@ -45,6 +45,22 @@ from PyQt5.QtWidgets import (
     QStyle,
     QSizePolicy,
 )
+
+from features.batch_export import batch_export as feature_batch_export
+from features.batch_export import refresh_export_config_list as feature_refresh_export_config_list
+from features.batch_export import refresh_export_folder_list as feature_refresh_export_folder_list
+from features.import_dedup import run_import_to_internal_library as feature_import_to_internal_library
+from features.product_grouping import build_second_layer as feature_build_second_layer
+from features.product_grouping import pick_candidates as feature_pick_candidates
+from features.product_grouping import resolve_candidate_item_path as feature_resolve_candidate_item_path
+from features.watermark_config import add_watermark_file as feature_add_watermark_file
+from features.watermark_config import apply_wm_settings as feature_apply_wm_settings
+from features.watermark_config import current_cfg_obj as feature_current_cfg_obj
+from features.watermark_config import delete_selected_watermark as feature_delete_selected_watermark
+from features.watermark_config import load_selected_config as feature_load_selected_config
+from features.watermark_config import refresh_watermark_lists as feature_refresh_watermark_lists
+from features.watermark_config import reset_wm_settings as feature_reset_wm_settings
+from features.watermark_config import save_current_config as feature_save_current_config
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -106,7 +122,7 @@ class ImagePreviewDialog(QDialog):
     def __init__(self, image_path: Path, parent=None) -> None:
         super().__init__(parent)
         self.image_path = image_path
-        self.setWindowTitle(f"查看图片 - {image_path.name}")
+        self.setWindowTitle(f"图片预览 - {image_path.name}")
         self.resize(1100, 760)
         self.label = QLabel()
         self.label.setAlignment(Qt.AlignCenter)
@@ -115,7 +131,7 @@ class ImagePreviewDialog(QDialog):
         lay.addWidget(self.label)
         self._pix = QPixmap(str(image_path))
         if self._pix.isNull():
-            self.label.setText("图片加载失败")
+            self.label.setText("图片不存在")
         else:
             self._refresh_pixmap()
 
@@ -145,7 +161,7 @@ class GroupSortManagerDialog(QDialog):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("分组排序管理")
+        self.setWindowTitle("图片排序管理")
         self.resize(420, 520)
         self.count_map = count_map
         self.ctime_map = ctime_map
@@ -161,10 +177,10 @@ class GroupSortManagerDialog(QDialog):
         btn_down = QPushButton("下移")
         btn_top = QPushButton("置顶")
         btn_bottom = QPushButton("置底")
-        btn_count_asc = QPushButton("按数量升序")
-        btn_count_desc = QPushButton("按数量降序")
-        btn_reset = QPushButton("恢复默认(创建时间)")
-        btn_ok = QPushButton("保存")
+        btn_count_asc = QPushButton("数量升序")
+        btn_count_desc = QPushButton("数量降序")
+        btn_reset = QPushButton("重置")
+        btn_ok = QPushButton("确定")
         btn_cancel = QPushButton("取消")
 
         btn_up.clicked.connect(lambda: self._move_current(-1))
@@ -510,7 +526,7 @@ def compress_image_to_under_2mb(src: Path, dst: Path, max_bytes: int = MAX_IMPOR
                 break
 
     if best is None:
-        raise RuntimeError(f"压缩失败: {src.name}")
+        raise RuntimeError(f"鍘嬬缉澶辫触: {src.name}")
     dst.write_bytes(best)
     return True, len(best)
 
@@ -585,7 +601,7 @@ def apply_watermark(img: Image.Image, wm: Image.Image, cfg: WatermarkConfig) -> 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("电商产品图分组水印工具")
+        self.setWindowTitle("图片批量加水印工具")
         self.resize(1200, 860)
 
         self.root = Path(__file__).resolve().parent
@@ -646,10 +662,10 @@ class MainWindow(QMainWindow):
         self.wm_tab = QWidget()
         self.export_tab = QWidget()
 
-        self.tabs.addTab(self.import_tab, "1) 导入与去重")
-        self.tabs.addTab(self.wm_tab, "2) 水印库与配置")
-        self.tabs.addTab(self.group_tab, "3) 商品图分组")
-        self.tabs.addTab(self.export_tab, "4) 批量出图")
+        self.tabs.addTab(self.import_tab, "1) 导入图片")
+        self.tabs.addTab(self.wm_tab, "2) 添加水印")
+        self.tabs.addTab(self.group_tab, "3) 分组管理")
+        self.tabs.addTab(self.export_tab, "4) 导出图片")
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
         self._build_import_tab()
@@ -672,7 +688,7 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
 
     def _pick_dir(self, line: QLineEdit) -> None:
-        d = QFileDialog.getExistingDirectory(self, "选择目录", str(self.root))
+        d = QFileDialog.getExistingDirectory(self, "选择导入文件夹", str(self.root))
         if d:
             line.setText(d)
 
@@ -691,7 +707,7 @@ class MainWindow(QMainWindow):
 
         form = QFormLayout()
         self.src_import_line = QLineEdit(str(self.root / "input_images"))
-        pick_btn = QPushButton("选择目录")
+        pick_btn = QPushButton("选择导入文件夹")
         pick_btn.clicked.connect(lambda: self._pick_dir(self.src_import_line))
         row = QHBoxLayout()
         self._normalize_row_spacing(row)
@@ -699,17 +715,17 @@ class MainWindow(QMainWindow):
         row.addWidget(pick_btn)
         w = QWidget()
         w.setLayout(row)
-        form.addRow("待导入根目录", w)
+        form.addRow("选择导入文件夹", w)
         layout.addLayout(form)
 
-        btn = QPushButton("开始导入并去重")
+        btn = QPushButton("导入")
         btn.clicked.connect(self.import_to_internal_library)
         layout.addWidget(btn)
 
         group_row = QHBoxLayout()
         left_col = QVBoxLayout()
         left_col.addWidget(QLabel("当前分组"))
-        self.internal_group_stats_label = QLabel("分组: 0  |  总图片: 0")
+        self.internal_group_stats_label = QLabel("分组数量: 0  |  图片数量: 0")
         left_col.addWidget(self.internal_group_stats_label)
         self.internal_group_list = QListWidget()
         self.internal_group_list.currentItemChanged.connect(self.on_internal_group_changed)
@@ -723,14 +739,14 @@ class MainWindow(QMainWindow):
         group_row.addWidget(left_wrap, 0)
 
         mid_col = QVBoxLayout()
-        mid_col.addWidget(QLabel("分组文件"))
+        mid_col.addWidget(QLabel("分组管理"))
         mode_row = QHBoxLayout()
         self._normalize_row_spacing(mode_row)
-        mode_row.addWidget(QLabel("显示模式"))
+        mode_row.addWidget(QLabel("文件视图模式"))
         self.internal_file_view_mode = QComboBox()
-        self.internal_file_view_mode.addItems(["详细信息", "大图标"])
+        self.internal_file_view_mode.addItems(["列表视图", "缩略图视图"])
         self.internal_file_view_mode.currentIndexChanged.connect(self.on_internal_file_view_mode_changed)
-        last_mode = self.app_settings.get("internal_file_view_mode", "大图标")
+        last_mode = self.app_settings.get("internal_file_view_mode", "缩略图视图")
         idx = self.internal_file_view_mode.findText(last_mode)
         if idx >= 0:
             self.internal_file_view_mode.setCurrentIndex(idx)
@@ -738,13 +754,13 @@ class MainWindow(QMainWindow):
         self.btn_file_select_all = QPushButton("全选")
         self.btn_file_select_all.clicked.connect(self.select_all_files)
         mode_row.addWidget(self.btn_file_select_all)
-        self.btn_file_select_none = QPushButton("全不选")
+        self.btn_file_select_none = QPushButton("取消选择")
         self.btn_file_select_none.clicked.connect(self.clear_file_selection)
         mode_row.addWidget(self.btn_file_select_none)
-        self.btn_batch_move = QPushButton("批量移动")
+        self.btn_batch_move = QPushButton("移动到其他分组")
         self.btn_batch_move.clicked.connect(self.batch_move_files)
         mode_row.addWidget(self.btn_batch_move)
-        self.btn_batch_delete = QPushButton("批量删除")
+        self.btn_batch_delete = QPushButton("删除")
         self.btn_batch_delete.clicked.connect(self.batch_delete_files)
         mode_row.addWidget(self.btn_batch_delete)
         mode_row.addStretch(1)
@@ -769,7 +785,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(group_row, 1)
 
         log_row = QVBoxLayout()
-        log_row.addWidget(QLabel("日志输出"))
+        log_row.addWidget(QLabel("日志"))
         self.import_log = QTextEdit()
         self.import_log.setReadOnly(True)
         self.import_log.setMaximumHeight(150)
@@ -871,7 +887,7 @@ class MainWindow(QMainWindow):
         current = [d.name for d in self._get_ordered_internal_group_dirs()]
         default = [d.name for d in self._default_internal_group_order()]
         if not current:
-            QMessageBox.information(self, "提示", "当前没有可排序分组")
+            QMessageBox.information(self, "提示", "当前没有分组")
             return
         dlg = GroupSortManagerDialog(current, default, self._group_count_map(), self._group_ctime_map(), self)
         if dlg.exec_() != QDialog.Accepted:
@@ -881,7 +897,7 @@ class MainWindow(QMainWindow):
         self.refresh_internal_group_list()
 
     def _update_internal_group_stats(self, group_count: int, total_images: int) -> None:
-        self.internal_group_stats_label.setText(f"分组: {group_count}  |  总图片: {total_images}")
+        self.internal_group_stats_label.setText(f"分组数量: {group_count}  |  图片数量: {total_images}")
         QApplication.processEvents()
 
     def refresh_internal_group_overview(self) -> None:
@@ -897,7 +913,7 @@ class MainWindow(QMainWindow):
         self.internal_group_list.blockSignals(True)
         self.internal_group_list.clear()
         for d, cnt in groups:
-            it = QListWidgetItem(f"{d.name} ({cnt} 张)")
+            it = QListWidgetItem(f"{d.name} ({cnt} 图片)")
             it.setData(Qt.UserRole, str(d))
             self.internal_group_list.addItem(it)
         if selected_dir:
@@ -918,7 +934,7 @@ class MainWindow(QMainWindow):
         self.current_internal_group_dir = None
         groups, total_images = self._collect_internal_group_info()
         for d, cnt in groups:
-            it = QListWidgetItem(f"{d.name} ({cnt} 张)")
+            it = QListWidgetItem(f"{d.name} ({cnt} 图片)")
             it.setData(Qt.UserRole, str(d))
             self.internal_group_list.addItem(it)
         if self.internal_group_list.count() > 0:
@@ -946,7 +962,7 @@ class MainWindow(QMainWindow):
         item = self.internal_group_list.itemAt(pos)
         if item is None:
             menu = QMenu(self)
-            act_create = menu.addAction("创建新分组")
+            act_create = menu.addAction("创建分组")
             act_clear_empty = menu.addAction("清除空分组")
             act_sort_mgr = menu.addAction("排序管理")
             chosen = menu.exec_(self.internal_group_list.mapToGlobal(pos))
@@ -965,14 +981,14 @@ class MainWindow(QMainWindow):
             return
 
         menu = QMenu(self)
-        act_rename = menu.addAction("重命名分组")
-        act_delete = menu.addAction("删除分组")
+        act_rename = menu.addAction("重命名")
+        act_delete = menu.addAction("删除")
         act_clear_empty = menu.addAction("清除空分组") if self._is_empty_group(group_dir) else None
         menu.addSeparator()
-        act_move_up = menu.addAction("排序上移")
-        act_move_down = menu.addAction("排序下移")
-        act_move_top = menu.addAction("排序置顶")
-        act_move_bottom = menu.addAction("排序置底")
+        act_move_up = menu.addAction("上移")
+        act_move_down = menu.addAction("下移")
+        act_move_top = menu.addAction("置顶")
+        act_move_bottom = menu.addAction("置底")
         act_sort_mgr = menu.addAction("排序管理")
         chosen = menu.exec_(self.internal_group_list.mapToGlobal(pos))
         if chosen is None:
@@ -1003,27 +1019,27 @@ class MainWindow(QMainWindow):
             return
 
     def create_internal_group(self) -> None:
-        name, ok = QInputDialog.getText(self, "创建新分组", "分组名称：")
+        name, ok = QInputDialog.getText(self, "创建分组", "请输入分组名称")
         if not ok:
             return
         name = name.strip()
         if not name:
-            QMessageBox.warning(self, "错误", "分组名称不能为空")
+            QMessageBox.warning(self, "提示", "分组名称不能为空")
             return
         invalid = set('<>:"/\\|?*')
         if any(ch in invalid for ch in name):
-            QMessageBox.warning(self, "错误", "分组名称包含非法字符")
+            QMessageBox.warning(self, "提示", "分组名称不能包含特殊字符")
             return
         target = self.internal_root / name
         if target.exists():
-            QMessageBox.warning(self, "错误", f"分组已存在: {name}")
+            QMessageBox.warning(self, "提示", f"分组名称已存在: {name}")
             return
         ensure_dir(target)
         cur_order = self._get_custom_group_order()
         if name not in cur_order:
             cur_order.append(name)
             self._set_custom_group_order(cur_order)
-        self._log(self.import_log, f"已创建新分组: {name}")
+        self._log(self.import_log, f"创建分组: {name}")
         self.refresh_internal_group_list()
         self.select_internal_group(target)
 
@@ -1037,12 +1053,12 @@ class MainWindow(QMainWindow):
             if not has_images and not has_subdirs and not has_other_files:
                 empty_groups.append(d)
         if not empty_groups:
-            QMessageBox.information(self, "提示", "没有可清除的空分组")
+            QMessageBox.information(self, "提示", "当前没有空分组")
             return
         ans = QMessageBox.question(
             self,
             "清除空分组",
-            f"确认清除 {len(empty_groups)} 个空分组吗？",
+            f"确定清除 {len(empty_groups)} 个空分组吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1055,7 +1071,7 @@ class MainWindow(QMainWindow):
                 removed += 1
             except Exception:
                 continue
-        self._log(self.import_log, f"已清除空分组 {removed} 个")
+        self._log(self.import_log, f"清除空分组: {removed} 个")
         self.refresh_internal_group_list()
 
     def select_internal_group(self, group_dir: Path) -> None:
@@ -1067,23 +1083,23 @@ class MainWindow(QMainWindow):
 
     def rename_internal_group(self, old_dir: Path) -> None:
         old_name = old_dir.name
-        new_name, ok = QInputDialog.getText(self, "重命名分组", "新分组名称：", text=old_name)
+        new_name, ok = QInputDialog.getText(self, "重命名", "请输入新的分组名称", text=old_name)
         if not ok:
             return
         new_name = new_name.strip()
         if not new_name:
-            QMessageBox.warning(self, "错误", "分组名称不能为空")
+            QMessageBox.warning(self, "提示", "分组名称不能为空")
             return
         invalid = set('<>:"/\\|?*')
         if any(ch in invalid for ch in new_name):
-            QMessageBox.warning(self, "错误", "分组名称包含非法字符")
+            QMessageBox.warning(self, "提示", "分组名称不能包含特殊字符")
             return
         if new_name == old_name:
             return
 
         new_dir = old_dir.parent / new_name
         if new_dir.exists():
-            QMessageBox.warning(self, "错误", f"目标分组已存在: {new_name}")
+            QMessageBox.warning(self, "提示", f"分组名称已存在: {new_name}")
             return
 
         self._stop_thumbnail_worker()
@@ -1107,18 +1123,18 @@ class MainWindow(QMainWindow):
             if old_name in order:
                 order[order.index(old_name)] = new_name
                 self._set_custom_group_order(order)
-            self._log(self.import_log, f"分组重命名: {old_name} -> {new_name}，并同步重命名 {len(temp_files)} 个文件")
+            self._log(self.import_log, f"重命名: {old_name} -> {new_name} 修改了 {len(temp_files)} 个文件")
             self.refresh_internal_group_list()
             self.select_internal_group(new_dir)
         except Exception as e:
-            QMessageBox.critical(self, "重命名失败", f"{type(e).__name__}: {e}")
+            QMessageBox.critical(self, "错误", f"{type(e).__name__}: {e}")
 
     def delete_internal_group(self, group_dir: Path) -> None:
         name = group_dir.name
         ans = QMessageBox.question(
             self,
             "删除分组",
-            f"确认删除分组“{name}”及其全部文件吗？此操作不可恢复。",
+            f"确定删除 {name} 分组吗？将会删除该分组及其所有图片",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1138,10 +1154,10 @@ class MainWindow(QMainWindow):
             save_json(self.index_path, self.md5_index)
             order = [n for n in self._get_custom_group_order() if n != name]
             self._set_custom_group_order(order)
-            self._log(self.import_log, f"分组已删除: {name}")
+            self._log(self.import_log, f"删除分组: {name}")
             self.refresh_internal_group_list()
         except Exception as e:
-            QMessageBox.critical(self, "删除失败", f"{type(e).__name__}: {e}")
+            QMessageBox.critical(self, "错误", f"{type(e).__name__}: {e}")
 
     def on_internal_file_double_clicked(self, item: QListWidgetItem) -> None:
         if item is None:
@@ -1180,7 +1196,7 @@ class MainWindow(QMainWindow):
 
     def view_internal_file(self, path: Path) -> None:
         if not path.exists():
-            QMessageBox.warning(self, "错误", "文件不存在")
+            QMessageBox.warning(self, "提示", "文件不存在")
             return
         dlg = ImagePreviewDialog(path, self)
         dlg.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -1210,10 +1226,10 @@ class MainWindow(QMainWindow):
         if exclude is not None:
             groups = [d for d in groups if d != exclude]
         if not groups:
-            QMessageBox.warning(self, "提示", "没有可选的目标分组")
+            QMessageBox.warning(self, "提示", "当前没有分组")
             return None
         names = [d.name for d in groups]
-        name, ok = QInputDialog.getItem(self, "选择目标分组", "目标分组：", names, 0, False)
+        name, ok = QInputDialog.getItem(self, "选择分组", "选择分组", names, 0, False)
         if not ok or not name:
             return None
         return self.internal_root / name
@@ -1237,7 +1253,7 @@ class MainWindow(QMainWindow):
 
     def move_files_to_other_group(self, files: List[Path]) -> None:
         if not files:
-            QMessageBox.information(self, "提示", "请先选择文件")
+            QMessageBox.information(self, "提示", "当前没有选择文件")
             return
         src_group = files[0].parent
         target_group = self.choose_target_group(exclude=src_group)
@@ -1258,20 +1274,20 @@ class MainWindow(QMainWindow):
                 self._remap_single_md5_path(p, dst)
                 moved += 1
             save_json(self.index_path, self.md5_index)
-            self._log(self.import_log, f"已移动 {moved} 张到分组: {target_group.name}")
+            self._log(self.import_log, f"移动文件: {moved} 个到 {target_group.name}")
             self.refresh_internal_group_list()
             self.select_internal_group(src_group if src_group.exists() else target_group)
         except Exception as e:
-            QMessageBox.critical(self, "移动失败", f"{type(e).__name__}: {e}")
+            QMessageBox.critical(self, "错误", f"{type(e).__name__}: {e}")
 
     def delete_internal_files(self, files: List[Path]) -> None:
         if not files:
-            QMessageBox.information(self, "提示", "请先选择文件")
+            QMessageBox.information(self, "提示", "当前没有选择文件")
             return
         ans = QMessageBox.question(
             self,
             "删除文件",
-            f"确认删除选中的 {len(files)} 个文件吗？此操作不可恢复。",
+            f"确定删除 {len(files)} 个文件吗？将会删除这些文件",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1289,7 +1305,7 @@ class MainWindow(QMainWindow):
                 continue
         self._remove_md5_entries_by_paths(deleted_paths)
         save_json(self.index_path, self.md5_index)
-        self._log(self.import_log, f"已删除文件 {deleted} 个")
+        self._log(self.import_log, f"删除文件: {deleted} 个")
         keep_group = self.current_internal_group_dir if self.current_internal_group_dir else None
         self.refresh_internal_group_list()
         if keep_group and keep_group.exists():
@@ -1379,7 +1395,7 @@ class MainWindow(QMainWindow):
         # Ignore stale signals from workers that are no longer current.
         if self.sender() is not self._thumb_worker:
             return
-        if self.internal_file_view_mode.currentText() != "大图标":
+        if self.internal_file_view_mode.currentText() != "缩略图视图":
             return
         if row < 0 or row >= self.internal_group_file_list.count():
             return
@@ -1396,7 +1412,7 @@ class MainWindow(QMainWindow):
         mode = self.internal_file_view_mode.currentText()
         files = [p for p in sorted(group_dir.iterdir()) if is_image_file(p)]
 
-        if mode == "大图标":
+        if mode == "缩略图视图":
             self.internal_group_file_list.setViewMode(QListView.IconMode)
             self.internal_group_file_list.setIconSize(QSize(self.thumb_w, self.thumb_h))
             self.internal_group_file_list.setGridSize(QSize(self.thumb_grid_w, self.thumb_grid_h))
@@ -1445,122 +1461,17 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def import_to_internal_library(self) -> None:
-        src_root = Path(self.src_import_line.text().strip())
-        if not src_root.exists():
-            QMessageBox.warning(self, "错误", "导入目录不存在")
-            return
-
-        imported = 0
-        skipped_dup = 0
-        folders_created = 0
-        compressed_count = 0
-        compress_saved_bytes = 0
-
-        children = [p for p in sorted(src_root.iterdir()) if p.is_dir()]
-        if not children:
-            QMessageBox.warning(self, "提示", "导入目录下没有子文件夹")
-            return
-        # Dedup scope = historical index + current import session.
-        # This prevents duplicates that appear multiple times in one single import run.
-        session_seen_md5 = set(self.md5_index.keys())
-
-        folder_images: List[Tuple[Path, str, List[Path]]] = []
-        total_images = 0
-        for source_folder in children:
-            base_name = source_folder.name.strip()
-            if not base_name:
-                continue
-            images = list_images(source_folder)
-            folder_images.append((source_folder, base_name, images))
-            total_images += len(images)
-
-        progress = QProgressDialog("正在导入并去重...", "", 0, max(1, total_images), self)
-        progress.setWindowTitle("导入中")
-        progress.setCancelButton(None)
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-        progress.show()
-        self.setEnabled(False)
-        QApplication.processEvents()
-
-        processed = 0
-        try:
-            for source_folder, base_name, images in folder_images:
-                if not images:
-                    self._log(self.import_log, f"{source_folder.name}: 未发现图片")
-                    continue
-
-                new_items: List[Tuple[Path, str]] = []
-                for img in images:
-                    processed += 1
-                    progress.setValue(processed)
-                    progress.setLabelText(f"正在检测: {img.name} ({processed}/{total_images})")
-                    QApplication.processEvents()
-                    # De-dup by original image bytes before any compression/renaming.
-                    h = md5_of_file(img)
-                    if h in session_seen_md5:
-                        skipped_dup += 1
-                        continue
-                    session_seen_md5.add(h)
-                    new_items.append((img, h))
-
-                if not new_items:
-                    self._log(self.import_log, f"{source_folder.name}: 全部重复，跳过")
-                    continue
-
-                dst_folder = self.internal_root / base_name
-                existed = dst_folder.exists()
-                ensure_dir(dst_folder)
-                if not existed:
-                    folders_created += 1
-
-                next_idx = next_image_index_in_folder(dst_folder, base_name)
-                for src_img, h in new_items:
-                    raw_ext = src_img.suffix.lower()
-                    dst_name = f"{base_name}{next_idx:03d}{raw_ext}"
-                    dst = dst_folder / dst_name
-                    was_compressed, out_size = compress_image_to_under_2mb(src_img, dst, MAX_IMPORT_IMAGE_BYTES)
-                    if was_compressed:
-                        new_dst = dst.with_suffix(".jpg")
-                        if new_dst != dst:
-                            if new_dst.exists():
-                                new_dst.unlink()
-                            dst.rename(new_dst)
-                            dst = new_dst
-                        compressed_count += 1
-                        saved = max(0, src_img.stat().st_size - out_size)
-                        compress_saved_bytes += saved
-                        self._log(
-                            self.import_log,
-                            f"{src_img.name}: 压缩完成 {src_img.stat().st_size/1024:.1f}KB -> {out_size/1024:.1f}KB",
-                        )
-                    self.md5_index[h] = str(dst.relative_to(self.root))
-                    imported += 1
-                    next_idx += 1
-                    if imported % 10 == 0:
-                        self.refresh_internal_group_overview()
-
-                final_count = len([p for p in dst_folder.iterdir() if is_image_file(p)])
-                if final_count < 50:
-                    self._log(self.import_log, f"{base_name}: 当前总数 {final_count} (<50)，建议后续补图")
-                else:
-                    self._log(self.import_log, f"{base_name}: 新增 {len(new_items)} 张，当前总数 {final_count} 张")
-                self.refresh_internal_group_overview()
-        finally:
-            self.setEnabled(True)
-            progress.setValue(progress.maximum())
-            progress.close()
-            QApplication.processEvents()
-
-        save_json(self.index_path, self.md5_index)
-        self._log(
-            self.import_log,
-            f"完成: 新增 {imported}，重复跳过 {skipped_dup}，压缩 {compressed_count}，"
-            f"节省 {(compress_saved_bytes/1024/1024):.2f}MB，新建内部库文件夹 {folders_created}",
+        feature_import_to_internal_library(
+            self,
+            list_images=list_images,
+            md5_of_file=md5_of_file,
+            ensure_dir=ensure_dir,
+            next_image_index_in_folder=next_image_index_in_folder,
+            compress_image_to_under_2mb=compress_image_to_under_2mb,
+            is_image_file=is_image_file,
+            save_json=save_json,
+            max_import_image_bytes=MAX_IMPORT_IMAGE_BYTES,
         )
-        self.refresh_internal_group_list()
 
     def _build_group_tab(self) -> None:
         layout = QVBoxLayout(self.group_tab)
@@ -1572,21 +1483,21 @@ class MainWindow(QMainWindow):
         self.per_group = QSpinBox()
         self.per_group.setRange(16, 20)
         self.per_group.setValue(16)
-        self.second_prefix = QLineEdit("组")
+        self.second_prefix = QLineEdit("第二层前缀")
 
-        cfg.addWidget(QLabel("目标组数"), 0, 0)
+        cfg.addWidget(QLabel("分组数量"), 0, 0)
         cfg.addWidget(self.group_count, 0, 1)
-        cfg.addWidget(QLabel("每组图片数"), 0, 2)
+        cfg.addWidget(QLabel("每组图片数量"), 0, 2)
         cfg.addWidget(self.per_group, 0, 3)
-        cfg.addWidget(QLabel("二层文件夹前缀"), 0, 4)
+        cfg.addWidget(QLabel("第二层前缀"), 0, 4)
         cfg.addWidget(self.second_prefix, 0, 5)
         layout.addLayout(cfg)
 
         btn_row = QHBoxLayout()
         self._normalize_row_spacing(btn_row)
-        self.btn_pick_candidates = QPushButton("随机抽样并打乱")
+        self.btn_pick_candidates = QPushButton("选择候选图片")
         self.btn_pick_candidates.clicked.connect(self.pick_candidates)
-        self.btn_build_second = QPushButton("按勾选生成商品图分组")
+        self.btn_build_second = QPushButton("生成第二层文件夹")
         self.btn_build_second.clicked.connect(self.build_second_layer)
         btn_row.addWidget(self.btn_pick_candidates)
         btn_row.addWidget(self.btn_build_second)
@@ -1600,93 +1511,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.group_log)
 
     def pick_candidates(self) -> None:
-        all_images = list_images(self.internal_root)
-        need = self.group_count.value() * self.per_group.value()
-        if len(all_images) < need:
-            QMessageBox.warning(self, "提示", f"内部库图片不足。需要 {need}，现有 {len(all_images)}")
-            return
-
-        self.candidate_images = random.sample(all_images, need)
-        random.shuffle(self.candidate_images)
-
-        self.candidate_list.clear()
-        for p in self.candidate_images:
-            item = QListWidgetItem(str(p.relative_to(self.root)))
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked)
-            item.setData(Qt.UserRole, str(p))
-            self.candidate_list.addItem(item)
-        self._log(self.group_log, f"已生成候选 {len(self.candidate_images)} 张，可人工取消勾选后再建组")
+        feature_pick_candidates(self, list_images=list_images)
 
     def _resolve_candidate_item_path(self, item: QListWidgetItem) -> Optional[Path]:
-        # Prefer stored absolute path, fallback to displayed text, then fuzzy lookup by filename.
-        raw = item.data(Qt.UserRole)
-        if raw:
-            p = Path(str(raw))
-            if p.exists():
-                return p
-
-        txt = item.text().strip()
-        if txt:
-            p = Path(txt)
-            if p.exists():
-                return p
-            p2 = self.root / txt
-            if p2.exists():
-                return p2
-
-            # Compatibility fallback: if folder suffix differs, try locating by filename.
-            name = p.name if p.name else p2.name
-            if name:
-                hits = list(self.internal_root.rglob(name))
-                if hits:
-                    return hits[0]
-        return None
+        return feature_resolve_candidate_item_path(self, item)
 
     def build_second_layer(self) -> None:
-        checked: List[Path] = []
-        for i in range(self.candidate_list.count()):
-            it = self.candidate_list.item(i)
-            if it.checkState() == Qt.Checked:
-                resolved = self._resolve_candidate_item_path(it)
-                if resolved is None:
-                    self._log(self.group_log, f"跳过无效路径: {it.text()}")
-                    continue
-                checked.append(resolved)
-
-        need = self.group_count.value() * self.per_group.value()
-        if len(checked) < need:
-            QMessageBox.warning(self, "提示", f"勾选数量不足。需要 {need}，当前 {len(checked)}")
-            return
-
-        random.shuffle(checked)
-        selected = checked[:need]
-        prefix = self.second_prefix.text().strip() or "组"
-
-        base_idx = next_folder_index(self.second_root, prefix)
-        cursor = 0
-        created = 0
-        for g in range(self.group_count.value()):
-            folder_name = f"{prefix}{base_idx + g:03d}"
-            out_dir = self.second_root / folder_name
-            ensure_dir(out_dir)
-            created += 1
-
-            for i in range(self.per_group.value()):
-                src = selected[cursor]
-                cursor += 1
-                ext = src.suffix.lower()
-                dst = out_dir / f"{folder_name}_{i + 1:03d}{ext}"
-                shutil.copy2(src, dst)
-
-            self._log(self.group_log, f"{folder_name}: {self.per_group.value()} 张")
-
-        self._log(self.group_log, f"完成: 生成二层文件夹 {created} 个，均为 {self.per_group.value()} 张")
-        self.refresh_export_folder_list()
+        feature_build_second_layer(self, next_folder_index=next_folder_index, ensure_dir=ensure_dir)
 
     def _build_wm_tab(self) -> None:
         layout = QHBoxLayout(self.wm_tab)
-        self.default_preview_image = self.root / "默认预览底图.jpg"
+        self.default_preview_image = self.root / "榛樿棰勮搴曞浘.jpg"
 
         left_col = QVBoxLayout()
         right_col = QVBoxLayout()
@@ -1695,32 +1530,32 @@ class MainWindow(QMainWindow):
         left_col.setSpacing(8)
         right_col.setSpacing(8)
 
-        top_box = QGroupBox("水印库")
+        top_box = QGroupBox("水印设置")
         top_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         top_box.setFixedHeight(96)
         top_layout = QFormLayout(top_box)
         wm_row = QHBoxLayout()
         self._normalize_row_spacing(wm_row)
         self.watermark_file_line = QLineEdit()
-        pick_wm = QPushButton("选择PNG")
+        pick_wm = QPushButton("选择PNG水印文件")
         pick_wm.clicked.connect(lambda: self._pick_file(self.watermark_file_line, "PNG Files (*.png)"))
         wm_row.addWidget(self.watermark_file_line)
         wm_row.addWidget(pick_wm)
         w_row1 = QWidget()
         w_row1.setLayout(wm_row)
-        top_layout.addRow("PNG水印", w_row1)
+        top_layout.addRow("PNG水印文件", w_row1)
 
         name_row = QHBoxLayout()
         self._normalize_row_spacing(name_row)
         self.watermark_name_line = QLineEdit()
-        self.watermark_name_line.setPlaceholderText("可选：自定义水印名称")
-        add_wm = QPushButton("加入水印库")
+        self.watermark_name_line.setPlaceholderText("请输入水印名称")
+        add_wm = QPushButton("添加水印")
         add_wm.clicked.connect(self.add_watermark_file)
         name_row.addWidget(self.watermark_name_line)
         name_row.addWidget(add_wm)
         w_row2 = QWidget()
         w_row2.setLayout(name_row)
-        top_layout.addRow("水印命名", w_row2)
+        top_layout.addRow("水印名称", w_row2)
         left_col.addWidget(top_box)
 
         setting_box = QGroupBox("水印设置")
@@ -1742,7 +1577,7 @@ class MainWindow(QMainWindow):
         self.wm_scale_slider = self._make_slider(10, 200, 100, self.update_preview)
         self.wm_rotate_slider = self._make_slider(-180, 180, 0, self.update_preview)
         self.wm_opacity_slider = self._make_slider(1, 100, 100, self.update_preview)
-        self.show_border_checkbox = QCheckBox("显示图框")
+        self.show_border_checkbox = QCheckBox("显示边框")
         self.show_border_checkbox.setChecked(False)
         self.show_border_checkbox.toggled.connect(self.update_preview)
         self.manual_border_checkbox = QCheckBox("手动调整边框")
@@ -1753,13 +1588,13 @@ class MainWindow(QMainWindow):
         setting_layout.addWidget(self.wm_selector, 0, 1, 1, 3)
         setting_layout.addWidget(self.show_border_checkbox, 1, 1)
         setting_layout.addWidget(self.manual_border_checkbox, 1, 2, 1, 2)
-        setting_layout.addWidget(QLabel("左右移动(X%)"), 2, 0)
+        setting_layout.addWidget(QLabel("水平位置(X%)"), 2, 0)
         setting_layout.addWidget(self.wm_x_slider, 2, 1, 1, 3)
-        setting_layout.addWidget(QLabel("上下移动(Y%)"), 3, 0)
+        setting_layout.addWidget(QLabel("垂直位置(Y%)"), 3, 0)
         setting_layout.addWidget(self.wm_y_slider, 3, 1, 1, 3)
         setting_layout.addWidget(QLabel("缩放(%)"), 4, 0)
         setting_layout.addWidget(self.wm_scale_slider, 4, 1, 1, 3)
-        setting_layout.addWidget(QLabel("旋转(°)"), 5, 0)
+        setting_layout.addWidget(QLabel("旋转(度)"), 5, 0)
         setting_layout.addWidget(self.wm_rotate_slider, 5, 1, 1, 3)
         setting_layout.addWidget(QLabel("透明度(%)"), 6, 0)
         setting_layout.addWidget(self.wm_opacity_slider, 6, 1, 1, 3)
@@ -1775,7 +1610,7 @@ class MainWindow(QMainWindow):
         setting_layout.addWidget(btn_delete, 7, 3)
         left_col.addWidget(setting_box)
 
-        cfg_box = QGroupBox("配置参数")
+        cfg_box = QGroupBox("配置设置")
         cfg_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         cfg_box.setFixedHeight(205)
         cfg_layout = QGridLayout(cfg_box)
@@ -1801,15 +1636,15 @@ class MainWindow(QMainWindow):
         for s in self._preview_sliders:
             s.editingFinished.connect(self.request_preview_update)
 
-        cfg_layout.addWidget(QLabel("配置名"), 0, 0)
+        cfg_layout.addWidget(QLabel("配置名称"), 0, 0)
         cfg_layout.addWidget(self.cfg_name, 0, 1, 1, 3)
         cfg_layout.addWidget(QLabel("X(%)"), 1, 0)
         cfg_layout.addWidget(self.final_x_slider, 1, 1, 1, 3)
         cfg_layout.addWidget(QLabel("Y(%)"), 2, 0)
         cfg_layout.addWidget(self.final_y_slider, 2, 1, 1, 3)
-        cfg_layout.addWidget(QLabel("缩放(占图宽%)"), 3, 0)
+        cfg_layout.addWidget(QLabel("缩放(%)"), 3, 0)
         cfg_layout.addWidget(self.final_scale_slider, 3, 1, 1, 3)
-        cfg_layout.addWidget(QLabel("旋转(°)"), 4, 0)
+        cfg_layout.addWidget(QLabel("旋转(度)"), 4, 0)
         cfg_layout.addWidget(self.final_rotate_slider, 4, 1, 1, 3)
         cfg_layout.addWidget(QLabel("透明度(%)"), 5, 0)
         cfg_layout.addWidget(self.final_opacity_slider, 5, 1, 1, 3)
@@ -1819,7 +1654,7 @@ class MainWindow(QMainWindow):
         sample_row = QHBoxLayout()
         self._normalize_row_spacing(sample_row)
         self.sample_image_line = QLineEdit(str(self.default_preview_image))
-        pick_sample = QPushButton("选择预览底图")
+        pick_sample = QPushButton("选择预览图片")
         pick_sample.clicked.connect(lambda: self._pick_file(self.sample_image_line, "Image Files (*.png *.jpg *.jpeg *.webp *.bmp)"))
         sample_row.addWidget(self.sample_image_line)
         sample_row.addWidget(pick_sample)
@@ -1835,7 +1670,7 @@ class MainWindow(QMainWindow):
         self.config_selector.currentIndexChanged.connect(self.load_selected_config)
         save_btn = QPushButton("保存配置")
         save_btn.clicked.connect(self.save_current_config)
-        btn_row.addWidget(QLabel("配置存档"))
+        btn_row.addWidget(QLabel("配置列表"))
         btn_row.addWidget(self.config_selector)
         btn_row.addWidget(save_btn)
         btn_w = QWidget()
@@ -1844,20 +1679,20 @@ class MainWindow(QMainWindow):
         btn_w.setFixedHeight(34)
         left_col.addWidget(btn_w)
 
-        self.preview_label = OverlayPreviewLabel("预览区")
+        self.preview_label = OverlayPreviewLabel("预览效果")
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumHeight(560)
         self.preview_label.setStyleSheet("border: 1px solid #999;")
         wm_show_box = QGroupBox("水印预览")
         wm_show_layout = QVBoxLayout(wm_show_box)
-        self.current_wm_preview = OverlayPreviewLabel("无")
+        self.current_wm_preview = OverlayPreviewLabel("当前水印预览")
         self.current_wm_preview.setAlignment(Qt.AlignCenter)
         self.current_wm_preview.setMinimumHeight(120)
         self.current_wm_preview.setMaximumHeight(120)
         self.current_wm_preview.setStyleSheet("border: 1px solid #999;")
         self.current_wm_preview.borderChanged.connect(self._on_wm_border_changed)
         self.preview_label.borderChanged.connect(self._on_fx_border_changed)
-        self.current_wm_name = QLabel("未选择水印")
+        self.current_wm_name = QLabel("当前水印名称")
         self.current_wm_name.setAlignment(Qt.AlignCenter)
         self.current_wm_name.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.current_wm_name.setFixedHeight(22)
@@ -1911,72 +1746,13 @@ class MainWindow(QMainWindow):
         return self._preview_interval_drag_ms if self._is_preview_slider_active() else self._preview_interval_normal_ms
 
     def add_watermark_file(self) -> None:
-        src = Path(self.watermark_file_line.text().strip())
-        if not src.exists() or src.suffix.lower() != ".png":
-            QMessageBox.warning(self, "错误", "请选择有效的PNG水印文件")
-            return
-        custom_name = self.watermark_name_line.text().strip()
-        if custom_name:
-            invalid = set('<>:"/\\|?*')
-            if any(ch in invalid for ch in custom_name):
-                QMessageBox.warning(self, "错误", "水印名称包含非法字符")
-                return
-            dst_name = f"{custom_name}.png"
-        else:
-            dst_name = src.name
-        dst = self.watermark_root / dst_name
-        if dst.exists():
-            stem = dst.stem
-            for i in range(2, 10000):
-                candidate = self.watermark_root / f"{stem}_{i}.png"
-                if not candidate.exists():
-                    dst = candidate
-                    break
-        shutil.copy2(src, dst)
-        self._log(self.wm_log, f"已入库水印: {dst.name}")
-        self.watermark_name_line.clear()
-        self.refresh_watermark_lists()
+        feature_add_watermark_file(self)
 
     def apply_wm_settings(self) -> None:
-        wm_file = self._selected_wm_filename()
-        if not wm_file:
-            QMessageBox.information(self, "提示", "请先选择水印")
-            return
-        wm_path = self.watermark_root / wm_file
-        if not wm_path.exists():
-            QMessageBox.warning(self, "错误", "水印文件不存在")
-            return
-        try:
-            with Image.open(wm_path) as wm_raw:
-                wm_processed = self._apply_watermark_image_settings(wm_raw)
-            wm_processed.save(wm_path, format="PNG")
-            self._wm_raw_cache_key = None
-            self._wm_raw_cache_img = None
-            self._wm_sim_cache_key = None
-            self._wm_sim_cache_img = None
-            self._wm_preview_pix_cache_key = None
-            self._wm_preview_pix_cache_img = None
-            self._wm_border_user_modified = False
-            self._fx_border_user_modified = False
-            self._wm_current_border_norm = None
-            self._fx_current_border_norm = None
-            # Once applied to file, reset sliders so "current status" equals saved watermark.
-            self._reset_wm_setting_sliders()
-            self.refresh_watermark_lists()
-            self.update_preview()
-            self._log(self.wm_log, f"已应用并覆盖水印: {wm_path.name}")
-        except Exception as e:
-            QMessageBox.critical(self, "应用失败", f"{type(e).__name__}: {e}")
+        feature_apply_wm_settings(self)
 
     def reset_wm_settings(self) -> None:
-        # Reset unsaved edits back to the last applied state (current file on disk).
-        self._reset_wm_setting_sliders()
-        self._wm_border_user_modified = False
-        self._fx_border_user_modified = False
-        self._wm_current_border_norm = None
-        self._fx_current_border_norm = None
-        self.update_preview()
-        self._log(self.wm_log, "已重置到该水印最后一次应用状态")
+        feature_reset_wm_settings(self)
 
     def _reset_wm_setting_sliders(self) -> None:
         self.wm_x_slider.setValue(50)
@@ -1986,37 +1762,7 @@ class MainWindow(QMainWindow):
         self.wm_opacity_slider.setValue(100)
 
     def delete_selected_watermark(self) -> None:
-        wm_file = self._selected_wm_filename()
-        if not wm_file:
-            QMessageBox.information(self, "提示", "请先选择水印")
-            return
-        wm_path = self.watermark_root / wm_file
-        if not wm_path.exists():
-            QMessageBox.warning(self, "错误", "水印文件不存在")
-            return
-        ans = QMessageBox.question(
-            self,
-            "删除水印",
-            f"确认删除水印“{wm_path.stem}”吗？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if ans != QMessageBox.Yes:
-            return
-        try:
-            wm_path.unlink()
-            self._wm_raw_cache_key = None
-            self._wm_raw_cache_img = None
-            self._wm_sim_cache_key = None
-            self._wm_sim_cache_img = None
-            self._wm_preview_pix_cache_key = None
-            self._wm_preview_pix_cache_img = None
-            self._log(self.wm_log, f"已删除水印: {wm_path.name}")
-            self.refresh_watermark_lists()
-            self.refresh_export_config_list()
-            self.update_preview()
-        except Exception as e:
-            QMessageBox.critical(self, "删除失败", f"{type(e).__name__}: {e}")
+        feature_delete_selected_watermark(self)
 
     def _selected_wm_filename(self) -> str:
         data = self.wm_selector.currentData()
@@ -2234,70 +1980,16 @@ class MainWindow(QMainWindow):
         self.update_preview()
 
     def refresh_watermark_lists(self) -> None:
-        current_wm = self._selected_wm_filename()
-        self.wm_selector.clear()
-        for p in sorted(self.watermark_root.glob("*.png")):
-            self.wm_selector.addItem(self._make_wm_selector_icon(p), p.stem, p.name)
-        if current_wm:
-            for i in range(self.wm_selector.count()):
-                if self.wm_selector.itemData(i) == current_wm:
-                    self.wm_selector.setCurrentIndex(i)
-                    break
-
-        current_cfg = self.config_selector.currentText() if hasattr(self, "config_selector") else ""
-        if hasattr(self, "config_selector"):
-            self.config_selector.clear()
-            for p in sorted(self.config_root.glob("*.json")):
-                self.config_selector.addItem(p.stem)
-            if current_cfg:
-                idx = self.config_selector.findText(current_cfg)
-                if idx >= 0:
-                    self.config_selector.setCurrentIndex(idx)
+        feature_refresh_watermark_lists(self)
 
     def current_cfg_obj(self) -> Optional[WatermarkConfig]:
-        wm_name = self._selected_wm_filename()
-        cfg_name = self.cfg_name.text().strip()
-        if not wm_name or not cfg_name:
-            return None
-        return WatermarkConfig(
-            name=cfg_name,
-            watermark_file=wm_name,
-            x_pct=self.final_x_slider.value(),
-            y_pct=self.final_y_slider.value(),
-            scale_pct=self.final_scale_slider.value(),
-            rotate_deg=self.final_rotate_slider.value(),
-            opacity_pct=self.final_opacity_slider.value(),
-        )
+        return feature_current_cfg_obj(self, WatermarkConfig)
 
     def save_current_config(self) -> None:
-        cfg = self.current_cfg_obj()
-        if not cfg:
-            QMessageBox.warning(self, "错误", "请先选择水印并填写配置名")
-            return
-        save_json(self.config_root / f"{cfg.name}.json", asdict(cfg))
-        self._log(self.wm_log, f"配置已保存: {cfg.name}")
-        self.refresh_watermark_lists()
-        self.refresh_export_config_list()
+        feature_save_current_config(self, save_json=save_json, watermark_config_cls=WatermarkConfig)
 
     def load_selected_config(self) -> None:
-        name = self.config_selector.currentText().strip()
-        if not name:
-            return
-        data = load_json(self.config_root / f"{name}.json", None)
-        if not data:
-            return
-        self.cfg_name.setText(data.get("name", name))
-        wm_file = data.get("watermark_file", "")
-        for i in range(self.wm_selector.count()):
-            if self.wm_selector.itemData(i) == wm_file:
-                self.wm_selector.setCurrentIndex(i)
-                break
-        self.final_x_slider.setValue(int(data.get("x_pct", 50)))
-        self.final_y_slider.setValue(int(data.get("y_pct", 50)))
-        self.final_scale_slider.setValue(int(data.get("scale_pct", 25)))
-        self.final_rotate_slider.setValue(int(data.get("rotate_deg", 0)))
-        self.final_opacity_slider.setValue(int(data.get("opacity_pct", 100)))
-        self.update_preview()
+        feature_load_selected_config(self, load_json=load_json)
 
     def update_preview(self) -> None:
         if self._preview_rendering:
@@ -2315,7 +2007,7 @@ class MainWindow(QMainWindow):
             internal_imgs = list_images(self.second_root)
             sample_path = internal_imgs[0] if internal_imgs else None
             if sample_path is None:
-                self.preview_label.setText("未找到默认预览底图.jpg，请手动选择预览底图")
+                self.preview_label.setText("鏈壘鍒伴粯璁ら瑙堝簳鍥?jpg锛岃鎵嬪姩閫夋嫨棰勮搴曞浘")
                 self._preview_rendering = False
                 return
 
@@ -2347,7 +2039,7 @@ class MainWindow(QMainWindow):
                     self.current_wm_preview.setText("")
                 else:
                     self.current_wm_preview.setPixmap(QPixmap())
-                    self.current_wm_preview.setText("水印预览失败")
+                    self.current_wm_preview.setText("姘村嵃棰勮澶辫触")
                 self.current_wm_name.setText(wm_path.stem)
                 # Two-layer simulation for effect preview; no persistent image data change.
                 effect_preview, self._fx_actual_border_norm = self._compose_effect_preview(
@@ -2360,8 +2052,8 @@ class MainWindow(QMainWindow):
             else:
                 empty = self._render_checkerboard_preview(QPixmap(), max(1, self.current_wm_preview.width() - 2), max(1, self.current_wm_preview.height() - 2))
                 self.current_wm_preview.setPixmap(empty)
-                self.current_wm_preview.setText("无")
-                self.current_wm_name.setText("未选择水印")
+                self.current_wm_preview.setText("当前水印预览")
+                self.current_wm_name.setText("当前水印名称")
                 self._wm_current_border_norm = None
                 self._fx_current_border_norm = None
                 self._wm_border_user_modified = False
@@ -2389,7 +2081,7 @@ class MainWindow(QMainWindow):
                 manual_mode,
             )
         except Exception as e:
-            self.preview_label.setText(f"预览失败: {type(e).__name__}: {e}")
+            self.preview_label.setText(f"预览错误: {type(e).__name__}: {e}")
         finally:
             self._preview_rendering = False
             if self._preview_dirty:
@@ -2401,7 +2093,7 @@ class MainWindow(QMainWindow):
         folder_box = QGroupBox("导出设置")
         f = QFormLayout(folder_box)
         self.second_line = QLineEdit(str(self.second_root))
-        btn1 = QPushButton("选择商品图分组目录")
+        btn1 = QPushButton("选择第二层文件夹")
         btn1.clicked.connect(lambda: self._pick_dir(self.second_line))
         row1 = QHBoxLayout()
         self._normalize_row_spacing(row1)
@@ -2409,10 +2101,10 @@ class MainWindow(QMainWindow):
         row1.addWidget(btn1)
         w1 = QWidget()
         w1.setLayout(row1)
-        f.addRow("商品图分组目录", w1)
+        f.addRow("第二层文件夹", w1)
 
         self.export_line = QLineEdit(str(self.export_root))
-        btn2 = QPushButton("选择导出目录")
+        btn2 = QPushButton("选择导出文件夹")
         btn2.clicked.connect(lambda: self._pick_dir(self.export_line))
         row2 = QHBoxLayout()
         self._normalize_row_spacing(row2)
@@ -2420,17 +2112,17 @@ class MainWindow(QMainWindow):
         row2.addWidget(btn2)
         w2 = QWidget()
         w2.setLayout(row2)
-        f.addRow("出图目录", w2)
+        f.addRow("导出文件夹", w2)
 
         self.export_config_selector = QComboBox()
-        f.addRow("水印配置", self.export_config_selector)
+        f.addRow("配置列表", self.export_config_selector)
         layout.addWidget(folder_box)
 
         btn_row = QHBoxLayout()
         self._normalize_row_spacing(btn_row)
-        refresh_btn = QPushButton("刷新文件夹与配置")
+        refresh_btn = QPushButton("刷新导出文件夹列表")
         refresh_btn.clicked.connect(self.refresh_export_folder_list)
-        run_btn = QPushButton("按配置批量加水印并出图")
+        run_btn = QPushButton("执行导出")
         run_btn.clicked.connect(self.batch_export)
         btn_row.addWidget(refresh_btn)
         btn_row.addWidget(run_btn)
@@ -2447,89 +2139,20 @@ class MainWindow(QMainWindow):
         self.refresh_export_config_list()
 
     def refresh_export_config_list(self) -> None:
-        current = self.export_config_selector.currentText()
-        self.export_config_selector.clear()
-        for p in sorted(self.config_root.glob("*.json")):
-            self.export_config_selector.addItem(p.stem)
-        if current:
-            idx = self.export_config_selector.findText(current)
-            if idx >= 0:
-                self.export_config_selector.setCurrentIndex(idx)
+        feature_refresh_export_config_list(self)
 
     def refresh_export_folder_list(self) -> None:
-        self.second_folder_list.clear()
-        second_root = Path(self.second_line.text().strip()) if hasattr(self, "second_line") else self.second_root
-        if not second_root.exists():
-            return
-        for d in sorted(second_root.iterdir()):
-            if not d.is_dir():
-                continue
-            cnt = len([p for p in d.iterdir() if is_image_file(p)])
-            item = QListWidgetItem(f"{d.name} ({cnt} 张)")
-            item.setData(Qt.UserRole, str(d))
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked)
-            self.second_folder_list.addItem(item)
+        feature_refresh_export_folder_list(self, is_image_file=is_image_file)
 
     def batch_export(self) -> None:
-        cfg_name = self.export_config_selector.currentText().strip()
-        if not cfg_name:
-            QMessageBox.warning(self, "错误", "请先选择水印配置")
-            return
-        cfg_data = load_json(self.config_root / f"{cfg_name}.json", None)
-        if not cfg_data:
-            QMessageBox.warning(self, "错误", "配置文件读取失败")
-            return
-        cfg = WatermarkConfig(**cfg_data)
-
-        wm_path = self.watermark_root / cfg.watermark_file
-        if not wm_path.exists():
-            QMessageBox.warning(self, "错误", f"水印文件不存在: {wm_path.name}")
-            return
-
-        second_root = Path(self.second_line.text().strip())
-        export_root = Path(self.export_line.text().strip())
-        ensure_dir(export_root)
-
-        selected_dirs: List[Path] = []
-        for i in range(self.second_folder_list.count()):
-            it = self.second_folder_list.item(i)
-            if it.checkState() == Qt.Checked:
-                selected_dirs.append(Path(it.data(Qt.UserRole)))
-        if not selected_dirs:
-            QMessageBox.warning(self, "提示", "请至少勾选一个二层文件夹")
-            return
-
-        ok_folder = 0
-        ok_img = 0
-        with Image.open(wm_path) as wm:
-            for src_dir in selected_dirs:
-                imgs = [p for p in sorted(src_dir.iterdir()) if is_image_file(p)]
-                if not (16 <= len(imgs) <= 20):
-                    self._log(self.export_log, f"跳过 {src_dir.name}: 数量 {len(imgs)} 不在 16-20")
-                    continue
-
-                out_dir = export_root / src_dir.name
-                ensure_dir(out_dir)
-                one_folder_ok = 0
-                for idx, img_path in enumerate(imgs, 1):
-                    try:
-                        with Image.open(img_path) as im:
-                            out = apply_watermark(im, wm, cfg)
-                        out_name = f"{src_dir.name}_{idx:03d}.jpg"
-                        out.save(out_dir / out_name, "JPEG", quality=95, optimize=True)
-                        one_folder_ok += 1
-                        ok_img += 1
-                    except Exception as e:
-                        self._log(self.export_log, f"失败 {img_path.name}: {type(e).__name__}")
-
-                if 16 <= one_folder_ok <= 20:
-                    ok_folder += 1
-                    self._log(self.export_log, f"{src_dir.name}: 出图 {one_folder_ok} 张")
-                else:
-                    self._log(self.export_log, f"{src_dir.name}: 警告，成功 {one_folder_ok} 张，不满足16-20")
-
-        self._log(self.export_log, f"批量完成: 合规文件夹 {ok_folder}，输出图片 {ok_img}")
+        feature_batch_export(
+            self,
+            load_json=load_json,
+            apply_watermark=apply_watermark,
+            ensure_dir=ensure_dir,
+            is_image_file=is_image_file,
+            watermark_config_cls=WatermarkConfig,
+        )
 
 
 def main() -> None:
@@ -2541,3 +2164,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
