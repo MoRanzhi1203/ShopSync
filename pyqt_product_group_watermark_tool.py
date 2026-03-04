@@ -76,6 +76,7 @@ class WatermarkConfig:
     scale_pct: int = 25
     rotate_deg: int = 0
     opacity_pct: int = 100
+    constrain_inside: bool = False
 
 
 class ThumbnailWorker(QObject):
@@ -410,20 +411,6 @@ class OverlayPreviewLabel(QLabel):
                     self._drag_last_y = event.y()
                     event.accept()
                     return
-        if (
-            event.button() == Qt.LeftButton
-            and self._show_frames
-            and self._manual_mode
-            and self._current_rect_norm is not None
-        ):
-            p_rect = self._pix_rect()
-            if p_rect is not None:
-                cr = self._norm_to_rect(self._current_rect_norm, p_rect)
-                edge = self._detect_edge(event.x(), event.y(), cr)
-                if edge is not None:
-                    self._drag_edge = edge
-                    event.accept()
-                    return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
@@ -647,6 +634,38 @@ def rotate_keep_scale(
     return out.resize((nw, nh), Image.Resampling.LANCZOS)
 
 
+def place_mark(
+    base_w: int,
+    base_h: int,
+    mark: Image.Image,
+    x_pct: int,
+    y_pct: int,
+    constrain_inside: bool,
+    constrain_bounds: Optional[Tuple[int, int, int, int]] = None,
+) -> Tuple[Image.Image, int, int]:
+    m = mark
+    bx, by, bw, bh = (0, 0, base_w, base_h)
+    if constrain_bounds is not None:
+        bx, by, bw, bh = constrain_bounds
+        bw = max(1, bw)
+        bh = max(1, bh)
+
+    if constrain_inside and (m.width > bw or m.height > bh):
+        fit_scale = min(bw / float(max(1, m.width)), bh / float(max(1, m.height)))
+        nw = max(1, int(round(m.width * fit_scale)))
+        nh = max(1, int(round(m.height * fit_scale)))
+        m = m.resize((nw, nh), Image.Resampling.LANCZOS)
+
+    cx = int(bx + bw * x_pct / 100)
+    cy = int(by + bh * y_pct / 100)
+    x = cx - m.width // 2
+    y = cy - m.height // 2
+    if constrain_inside:
+        x = max(bx, min(bx + bw - m.width, x))
+        y = max(by, min(by + bh - m.height, y))
+    return m, x, y
+
+
 def apply_watermark(img: Image.Image, wm: Image.Image, cfg: WatermarkConfig) -> Image.Image:
     base = img.convert("RGBA")
     mark = wm.convert("RGBA")
@@ -661,10 +680,14 @@ def apply_watermark(img: Image.Image, wm: Image.Image, cfg: WatermarkConfig) -> 
         alpha = mark.getchannel("A").point(lambda x: int(x * cfg.opacity_pct / 100))
         mark.putalpha(alpha)
 
-    cx = int(base.width * cfg.x_pct / 100)
-    cy = int(base.height * cfg.y_pct / 100)
-    x = cx - mark.width // 2
-    y = cy - mark.height // 2
+    mark, x, y = place_mark(
+        base.width,
+        base.height,
+        mark,
+        cfg.x_pct,
+        cfg.y_pct,
+        True,
+    )
 
     layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
     layer.paste(mark, (x, y), mark)
@@ -713,6 +736,7 @@ class MainWindow(QMainWindow):
         self._preview_dirty = False
         self._sample_preview_cache_key: Optional[Tuple[str, float, int, int]] = None
         self._sample_preview_cache_img: Optional[Image.Image] = None
+        self._sample_preview_content_rect: Tuple[int, int, int, int] = (0, 0, 1, 1)
         self._wm_raw_cache_key: Optional[Tuple[str, float]] = None
         self._wm_raw_cache_img: Optional[Image.Image] = None
         self._wm_sim_cache_key: Optional[Tuple[object, ...]] = None
@@ -1867,11 +1891,11 @@ class MainWindow(QMainWindow):
         p.end()
         return canvas
 
-    def _get_cached_sample_preview(self, sample_path: Path, tw: int, th: int) -> Image.Image:
+    def _get_cached_sample_preview(self, sample_path: Path, tw: int, th: int) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
         st = sample_path.stat()
         key = (str(sample_path), st.st_mtime, tw, th)
         if self._sample_preview_cache_key == key and self._sample_preview_cache_img is not None:
-            return self._sample_preview_cache_img.copy()
+            return self._sample_preview_cache_img.copy(), self._sample_preview_content_rect
 
         with Image.open(sample_path) as img:
             src = img.convert("RGB")
@@ -1882,7 +1906,8 @@ class MainWindow(QMainWindow):
             canvas.paste(fitted, (x, y))
         self._sample_preview_cache_key = key
         self._sample_preview_cache_img = canvas
-        return canvas.copy()
+        self._sample_preview_content_rect = (x, y, fitted.width, fitted.height)
+        return canvas.copy(), self._sample_preview_content_rect
 
     def _get_cached_wm_raw(self, wm_path: Path) -> Image.Image:
         st = wm_path.stat()
@@ -1914,6 +1939,7 @@ class MainWindow(QMainWindow):
         fast_mode: bool = False,
         use_alpha_bbox: bool = False,
         final_rotate_override: Optional[int] = None,
+        constrain_bounds: Optional[Tuple[int, int, int, int]] = None,
     ) -> Tuple[Image.Image, Tuple[float, float, float, float]]:
         # Preview-only composition: simulate two layers (base + watermark), no file write.
         base = base_img.convert("RGBA")
@@ -1933,10 +1959,15 @@ class MainWindow(QMainWindow):
             alpha = mark.getchannel("A").point(lambda x: int(x * op / 100))
             mark.putalpha(alpha)
 
-        cx = int(base.width * self.final_x_slider.value() / 100)
-        cy = int(base.height * self.final_y_slider.value() / 100)
-        x = cx - mark.width // 2
-        y = cy - mark.height // 2
+        mark, x, y = place_mark(
+            base.width,
+            base.height,
+            mark,
+            self.final_x_slider.value(),
+            self.final_y_slider.value(),
+            True,
+            constrain_bounds=constrain_bounds,
+        )
 
         wm_overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
         wm_overlay.paste(mark, (x, y), mark)
@@ -2120,7 +2151,7 @@ class MainWindow(QMainWindow):
         try:
             tw = max(1, self.preview_label.width() - 8)
             th = max(1, self.preview_label.height() - 8)
-            base_preview = self._get_cached_sample_preview(sample_path, tw, th)
+            base_preview, base_content_rect = self._get_cached_sample_preview(sample_path, tw, th)
             effect_preview = base_preview.convert("RGBA")
             show_frames = self.show_border_checkbox.isChecked()
             self._wm_actual_border_norm = None
@@ -2163,6 +2194,7 @@ class MainWindow(QMainWindow):
                     fast_mode=fast_mode,
                     use_alpha_bbox=False,
                     final_rotate_override=None,
+                    constrain_bounds=base_content_rect,
                 )
                 _, self._fx_actual_border_norm = self._compose_effect_preview(
                     base_preview,
@@ -2170,6 +2202,7 @@ class MainWindow(QMainWindow):
                     fast_mode=fast_mode,
                     use_alpha_bbox=False,
                     final_rotate_override=0,
+                    constrain_bounds=base_content_rect,
                 )
             else:
                 empty = self._render_checkerboard_preview(QPixmap(), max(1, self.current_wm_preview.width() - 2), max(1, self.current_wm_preview.height() - 2))

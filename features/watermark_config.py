@@ -151,6 +151,7 @@ def current_cfg_obj(ctx, watermark_config_cls: Type) -> Optional[object]:
         scale_pct=ctx.final_scale_slider.value(),
         rotate_deg=ctx.final_rotate_slider.value(),
         opacity_pct=ctx.final_opacity_slider.value(),
+        constrain_inside=True,
     )
 
 
