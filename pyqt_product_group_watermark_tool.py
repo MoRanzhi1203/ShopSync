@@ -603,6 +603,50 @@ def pil_to_qpixmap(img: Image.Image) -> QPixmap:
     return QPixmap.fromImage(qimg.copy())
 
 
+def trim_alpha_border(img: Image.Image) -> Image.Image:
+    rgba = img.convert("RGBA")
+    bbox = rgba.getchannel("A").getbbox()
+    if not bbox:
+        return rgba
+    return rgba.crop(bbox)
+
+
+def rotate_keep_scale(
+    img: Image.Image,
+    angle_deg: int,
+    *,
+    resample,
+) -> Image.Image:
+    """Rotate without angle-dependent apparent scaling (normalize by max side)."""
+    src = img.convert("RGBA")
+    src_bbox = src.getchannel("A").getbbox()
+    if not src_bbox:
+        return src
+    _, _, sr, sb = src_bbox
+    src_w = max(1, sr - src_bbox[0])
+    src_h = max(1, sb - src_bbox[1])
+    src_area = float(max(1, src_w * src_h))
+
+    out = src.rotate(angle_deg % 360, expand=True, resample=resample)
+    out = trim_alpha_border(out)
+    out_bbox = out.getchannel("A").getbbox()
+    if not out_bbox:
+        return out
+    _, _, or_, ob = out_bbox
+    out_w = max(1, or_ - out_bbox[0])
+    out_h = max(1, ob - out_bbox[1])
+    out_area = float(max(1, out_w * out_h))
+    if out_area <= 0:
+        return out
+    # Keep apparent size stable under rotation by preserving alpha-bbox area.
+    scale = (src_area / out_area) ** 0.5
+    if abs(scale - 1.0) < 1e-6:
+        return out
+    nw = max(1, int(round(out.width * scale)))
+    nh = max(1, int(round(out.height * scale)))
+    return out.resize((nw, nh), Image.Resampling.LANCZOS)
+
+
 def apply_watermark(img: Image.Image, wm: Image.Image, cfg: WatermarkConfig) -> Image.Image:
     base = img.convert("RGBA")
     mark = wm.convert("RGBA")
@@ -611,7 +655,7 @@ def apply_watermark(img: Image.Image, wm: Image.Image, cfg: WatermarkConfig) -> 
     ratio = target_w / mark.width
     target_h = max(8, int(mark.height * ratio))
     mark = mark.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    mark = mark.rotate(cfg.rotate_deg, expand=True, resample=Image.Resampling.BICUBIC)
+    mark = rotate_keep_scale(mark, cfg.rotate_deg, resample=Image.Resampling.BICUBIC)
 
     if cfg.opacity_pct < 100:
         alpha = mark.getchannel("A").point(lambda x: int(x * cfg.opacity_pct / 100))
@@ -1605,7 +1649,7 @@ class MainWindow(QMainWindow):
         self.wm_selector.setItemDelegate(WatermarkComboDelegate(self.wm_selector))
         self.wm_selector.currentIndexChanged.connect(self._on_wm_selector_changed)
 
-        self.wm_rotate_slider = self._make_slider(-180, 180, 0, self.update_preview)
+        self.wm_rotate_slider = self._make_slider(-999999, 999999, 0, self.update_preview)
         self.wm_opacity_slider = self._make_slider(1, 100, 100, self.update_preview)
         self.show_border_checkbox = QCheckBox("显示边框")
         self.show_border_checkbox.setChecked(False)
@@ -1649,7 +1693,7 @@ class MainWindow(QMainWindow):
         self.final_x_slider = self._make_slider(0, 100, 50, self.update_preview)
         self.final_y_slider = self._make_slider(0, 100, 50, self.update_preview)
         self.final_scale_slider = self._make_slider(5, 100, 25, self.update_preview)
-        self.final_rotate_slider = self._make_slider(-180, 180, 0, self.update_preview)
+        self.final_rotate_slider = self._make_slider(-999999, 999999, 0, self.update_preview)
         self.final_opacity_slider = self._make_slider(1, 100, 100, self.update_preview)
         self._preview_sliders = [
             self.wm_rotate_slider,
@@ -1712,10 +1756,12 @@ class MainWindow(QMainWindow):
         self.preview_label.setStyleSheet("border: 1px solid #999;")
         wm_show_box = QGroupBox("水印预览")
         wm_show_layout = QVBoxLayout(wm_show_box)
+        wm_show_layout.setContentsMargins(4, 8, 4, 4)
+        wm_show_layout.setSpacing(4)
         self.current_wm_preview = OverlayPreviewLabel("当前水印预览")
         self.current_wm_preview.setAlignment(Qt.AlignCenter)
-        self.current_wm_preview.setMinimumHeight(120)
-        self.current_wm_preview.setMaximumHeight(120)
+        self.current_wm_preview.setMinimumHeight(96)
+        self.current_wm_preview.setMaximumHeight(96)
         self.current_wm_preview.setStyleSheet("border: 1px solid #999;")
         self.preview_label.overlayDragged.connect(self._on_effect_overlay_dragged)
         self.current_wm_name = QLabel("当前水印名称")
@@ -1725,7 +1771,7 @@ class MainWindow(QMainWindow):
         wm_show_layout.addWidget(self.current_wm_preview)
         wm_show_layout.addWidget(self.current_wm_name)
         wm_show_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        wm_show_box.setFixedHeight(176)
+        wm_show_box.setFixedHeight(148)
         right_col.addWidget(wm_show_box, 0)
 
         effect_box = QGroupBox("效果预览")
@@ -1853,7 +1899,7 @@ class MainWindow(QMainWindow):
         # Watermark settings: process the watermark image itself.
         mark = wm_img.convert("RGBA")
         rotate_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.BICUBIC
-        mark = mark.rotate(self.wm_rotate_slider.value(), expand=True, resample=rotate_resample)
+        mark = rotate_keep_scale(mark, self.wm_rotate_slider.value(), resample=rotate_resample)
 
         op = self.wm_opacity_slider.value()
         if op < 100:
@@ -1862,7 +1908,12 @@ class MainWindow(QMainWindow):
         return mark
 
     def _compose_effect_preview(
-        self, base_img: Image.Image, wm_layer: Image.Image, fast_mode: bool = False
+        self,
+        base_img: Image.Image,
+        wm_layer: Image.Image,
+        fast_mode: bool = False,
+        use_alpha_bbox: bool = False,
+        final_rotate_override: Optional[int] = None,
     ) -> Tuple[Image.Image, Tuple[float, float, float, float]]:
         # Preview-only composition: simulate two layers (base + watermark), no file write.
         base = base_img.convert("RGBA")
@@ -1874,7 +1925,8 @@ class MainWindow(QMainWindow):
         ratio = target_w / max(1, mark.width)
         target_h = max(8, int(mark.height * ratio))
         mark = mark.resize((target_w, target_h), resize_resample)
-        mark = mark.rotate(self.final_rotate_slider.value(), expand=True, resample=rotate_resample)
+        rotate_deg = self.final_rotate_slider.value() if final_rotate_override is None else int(final_rotate_override)
+        mark = rotate_keep_scale(mark, rotate_deg, resample=rotate_resample)
 
         op = self.final_opacity_slider.value()
         if op < 100:
@@ -1889,15 +1941,18 @@ class MainWindow(QMainWindow):
         wm_overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
         wm_overlay.paste(mark, (x, y), mark)
         out = Image.alpha_composite(base, wm_overlay)
-        bbox = mark.getchannel("A").getbbox()
-        if bbox:
-            l, t, r, b = bbox
-            ax = x + l
-            ay = y + t
-            aw = max(1, r - l)
-            ah = max(1, b - t)
+        if use_alpha_bbox:
+            bbox = mark.getchannel("A").getbbox()
+            if bbox:
+                l, t, r, b = bbox
+                ax = x + l
+                ay = y + t
+                aw = max(1, r - l)
+                ah = max(1, b - t)
+            else:
+                ax, ay, aw, ah = x, y, max(1, mark.width), max(1, mark.height)
         else:
-            ax, ay, aw, ah = x, y, mark.width, mark.height
+            ax, ay, aw, ah = x, y, max(1, mark.width), max(1, mark.height)
         bx = ax / float(max(1, base.width))
         by = ay / float(max(1, base.height))
         bw = aw / float(max(1, base.width))
@@ -1927,8 +1982,9 @@ class MainWindow(QMainWindow):
         target_w: int,
         target_h: int,
         cache_tag: Tuple[object, ...],
+        use_alpha_bbox: bool = False,
     ) -> Tuple[QPixmap, Tuple[float, float, float, float]]:
-        key = (cache_tag, target_w, target_h)
+        key = (cache_tag, target_w, target_h, use_alpha_bbox)
         if (
             self._wm_preview_pix_cache_key == key
             and self._wm_preview_pix_cache_img is not None
@@ -1961,17 +2017,22 @@ class MainWindow(QMainWindow):
         p.drawPixmap(dx, dy, draw)
         p.end()
 
-        rgba = wm_processed.convert("RGBA")
-        bbox = rgba.getchannel("A").getbbox()
-        if bbox and wm_processed.width > 0 and wm_processed.height > 0:
-            l, t, r, b = bbox
-            sx = draw.width() / float(wm_processed.width)
-            sy = draw.height() / float(wm_processed.height)
-            ax = dx + l * sx
-            ay = dy + t * sy
-            aw = max(1.0, (r - l) * sx)
-            ah = max(1.0, (b - t) * sy)
-            bbox_norm = self._clamp_norm_rect((ax / w, ay / h, aw / w, ah / h))
+        if use_alpha_bbox:
+            rgba = wm_processed.convert("RGBA")
+            bbox = rgba.getchannel("A").getbbox()
+            if bbox and wm_processed.width > 0 and wm_processed.height > 0:
+                l, t, r, b = bbox
+                sx = draw.width() / float(wm_processed.width)
+                sy = draw.height() / float(wm_processed.height)
+                ax = dx + l * sx
+                ay = dy + t * sy
+                aw = max(1.0, (r - l) * sx)
+                ah = max(1.0, (b - t) * sy)
+                bbox_norm = self._clamp_norm_rect((ax / w, ay / h, aw / w, ah / h))
+            else:
+                bbox_norm = self._clamp_norm_rect(
+                    (dx / float(w), dy / float(h), draw.width() / float(w), draw.height() / float(h))
+                )
         else:
             bbox_norm = self._clamp_norm_rect(
                 (dx / float(w), dy / float(h), draw.width() / float(w), draw.height() / float(h))
@@ -2077,12 +2138,14 @@ class MainWindow(QMainWindow):
                     max(1, self.current_wm_preview.width() - 2),
                     max(1, self.current_wm_preview.height() - 2),
                     cache_tag=("wm_preview_current", str(wm_path), wm_stat.st_mtime, self.wm_rotate_slider.value(), self.wm_opacity_slider.value()),
+                    use_alpha_bbox=True,
                 )
                 _, wm_actual_bbox_norm = self._get_cached_wm_preview_pix(
-                    wm_raw_actual,
+                    wm_processed_current,
                     max(1, self.current_wm_preview.width() - 2),
                     max(1, self.current_wm_preview.height() - 2),
-                    cache_tag=("wm_preview_actual", str(wm_path), wm_stat.st_mtime),
+                    cache_tag=("wm_preview_actual", str(wm_path), wm_stat.st_mtime, self.wm_rotate_slider.value(), self.wm_opacity_slider.value()),
+                    use_alpha_bbox=False,
                 )
                 self._wm_actual_border_norm = wm_actual_bbox_norm
                 self._wm_current_border_norm = wm_current_bbox_norm
@@ -2098,11 +2161,15 @@ class MainWindow(QMainWindow):
                     base_preview,
                     wm_processed_current,
                     fast_mode=fast_mode,
+                    use_alpha_bbox=False,
+                    final_rotate_override=None,
                 )
                 _, self._fx_actual_border_norm = self._compose_effect_preview(
                     base_preview,
                     wm_raw_actual,
                     fast_mode=fast_mode,
+                    use_alpha_bbox=False,
+                    final_rotate_override=0,
                 )
             else:
                 empty = self._render_checkerboard_preview(QPixmap(), max(1, self.current_wm_preview.width() - 2), max(1, self.current_wm_preview.height() - 2))
@@ -2122,13 +2189,13 @@ class MainWindow(QMainWindow):
             )
             self.preview_label.setPixmap(pix)
             self.current_wm_preview.set_overlay_rects(
-                self._wm_actual_border_norm,
+                None,
                 self._wm_current_border_norm,
                 show_frames,
                 False,
             )
             self.preview_label.set_overlay_rects(
-                self._fx_actual_border_norm,
+                None,
                 self._fx_current_border_norm,
                 show_frames,
                 wm_path is not None and wm_path.exists(),
