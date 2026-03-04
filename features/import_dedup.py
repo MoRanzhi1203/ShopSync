@@ -17,32 +17,39 @@ def run_import_to_internal_library(
     save_json: Callable[[Path, object], None],
     max_import_image_bytes: int,
 ) -> None:
-    src_root = Path(ctx.src_import_line.text().strip())
-    if not src_root.exists():
-        QMessageBox.warning(ctx, "错误", "导入目录不存在")
-        return
-
     imported = 0
     skipped_dup = 0
     folders_created = 0
     compressed_count = 0
     compress_saved_bytes = 0
 
-    children = [p for p in sorted(src_root.iterdir()) if p.is_dir()]
-    if not children:
-        QMessageBox.warning(ctx, "提示", "导入目录下没有子文件夹")
-        return
-
     session_seen_md5 = set(ctx.md5_index.keys())
     folder_images: List[Tuple[Path, str, List[Path]]] = []
     total_images = 0
-    for source_folder in children:
-        base_name = source_folder.name.strip()
-        if not base_name:
-            continue
-        images = list_images(source_folder)
-        folder_images.append((source_folder, base_name, images))
-        total_images += len(images)
+
+    src_root = Path(ctx.src_import_line.text().strip())
+    if not src_root.exists():
+        QMessageBox.warning(ctx, "错误", "导入目录不存在")
+        return
+    children = [p for p in sorted(src_root.iterdir()) if p.is_dir()]
+    if children:
+        for source_folder in children:
+            group_name = source_folder.name.strip()
+            if not group_name:
+                continue
+            images = list_images(source_folder)
+            folder_images.append((source_folder, group_name, images))
+            total_images += len(images)
+    else:
+        # Fallback for single first-level folder import:
+        # if selected folder directly contains images, create/use group by this folder name.
+        direct_images = list_images(src_root)
+        if not direct_images:
+            QMessageBox.warning(ctx, "提示", "导入目录下没有子文件夹，也没有可导入图片")
+            return
+        group_name = src_root.name.strip() or "未命名分组"
+        folder_images.append((src_root, group_name, direct_images))
+        total_images += len(direct_images)
 
     progress = QProgressDialog("正在导入并去重...", "", 0, max(1, total_images), ctx)
     progress.setWindowTitle("导入中")
@@ -57,7 +64,7 @@ def run_import_to_internal_library(
 
     processed = 0
     try:
-        for source_folder, base_name, images in folder_images:
+        for source_folder, group_name, images in folder_images:
             if not images:
                 ctx._log(ctx.import_log, f"{source_folder.name}: 未发现图片")
                 continue
@@ -79,16 +86,16 @@ def run_import_to_internal_library(
                 ctx._log(ctx.import_log, f"{source_folder.name}: 全部重复，跳过")
                 continue
 
-            dst_folder = ctx.internal_root / base_name
+            dst_folder = ctx.internal_root / group_name
             existed = dst_folder.exists()
             ensure_dir(dst_folder)
             if not existed:
                 folders_created += 1
 
-            next_idx = next_image_index_in_folder(dst_folder, base_name)
+            next_idx = next_image_index_in_folder(dst_folder, group_name)
             for src_img, h in new_items:
                 raw_ext = src_img.suffix.lower()
-                dst_name = f"{base_name}{next_idx:03d}{raw_ext}"
+                dst_name = f"{group_name}{next_idx:03d}{raw_ext}"
                 dst = dst_folder / dst_name
                 was_compressed, out_size = compress_image_to_under_2mb(src_img, dst, max_import_image_bytes)
                 if was_compressed:
@@ -113,9 +120,9 @@ def run_import_to_internal_library(
 
             final_count = len([p for p in dst_folder.iterdir() if is_image_file(p)])
             if final_count < 50:
-                ctx._log(ctx.import_log, f"{base_name}: 当前总数 {final_count} (<50)，建议后续补图")
+                ctx._log(ctx.import_log, f"{group_name}: 当前总数 {final_count} (<50)，建议后续补图")
             else:
-                ctx._log(ctx.import_log, f"{base_name}: 新增 {len(new_items)} 张，当前总数 {final_count} 张")
+                ctx._log(ctx.import_log, f"{group_name}: 新增 {len(new_items)} 张，当前总数 {final_count} 张")
             ctx.refresh_internal_group_overview()
     finally:
         ctx.setEnabled(True)
@@ -127,7 +134,6 @@ def run_import_to_internal_library(
     ctx._log(
         ctx.import_log,
         f"完成: 新增 {imported}，重复跳过 {skipped_dup}，压缩 {compressed_count}，"
-        f"节省 {(compress_saved_bytes/1024/1024):.2f}MB，新建内部库文件夹 {folders_created}",
+        f"节省 {(compress_saved_bytes/1024/1024):.2f}MB，新建内部分组 {folders_created}",
     )
     ctx.refresh_internal_group_list()
-
