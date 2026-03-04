@@ -76,7 +76,7 @@ class WatermarkConfig:
     scale_pct: int = 25
     rotate_deg: int = 0
     opacity_pct: int = 100
-    constrain_inside: bool = False
+    constrain_inside: bool = True
 
 
 class ThumbnailWorker(QObject):
@@ -286,26 +286,33 @@ class WatermarkComboDelegate(QStyledItemDelegate):
         icon = index.data(Qt.DecorationRole)
         text = str(index.data(Qt.DisplayRole) or "")
 
-        icon_size = 44
-        top_margin = 4
+        icon_size = 52
+        top_margin = 2
         icon_x = rect.x() + (rect.width() - icon_size) // 2
         icon_y = rect.y() + top_margin
         if isinstance(icon, QIcon) and not icon.isNull():
             icon.paint(painter, QRect(icon_x, icon_y, icon_size, icon_size), Qt.AlignCenter)
 
         painter.setPen(text_color)
-        text_rect = QRect(rect.x() + 4, rect.y() + top_margin + icon_size + 4, rect.width() - 8, rect.height() - icon_size - 8)
-        painter.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop, text)
+        bottom_padding = 3
+        text_rect = QRect(
+            rect.x() + 4,
+            rect.y() + top_margin + icon_size + 2,
+            rect.width() - 8,
+            max(1, rect.height() - icon_size - top_margin - 2 - bottom_padding),
+        )
+        painter.drawText(text_rect, Qt.AlignHCenter | Qt.AlignBottom, text)
         painter.restore()
 
     def sizeHint(self, option, index):
         _ = option, index
-        return QSize(92, 68)
+        return QSize(96, 76)
 
 
 class OverlayPreviewLabel(QLabel):
     borderChanged = pyqtSignal(object)
     overlayDragged = pyqtSignal(float, float)
+    overlayDragStateChanged = pyqtSignal(bool)
 
     def __init__(self, text: str = "", parent=None) -> None:
         super().__init__(text, parent)
@@ -409,6 +416,7 @@ class OverlayPreviewLabel(QLabel):
                     self._drag_move = True
                     self._drag_last_x = event.x()
                     self._drag_last_y = event.y()
+                    self.overlayDragStateChanged.emit(True)
                     event.accept()
                     return
         super().mousePressEvent(event)
@@ -453,6 +461,8 @@ class OverlayPreviewLabel(QLabel):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._drag_move:
+            self.overlayDragStateChanged.emit(False)
         self._drag_move = False
         self._drag_edge = None
         super().mouseReleaseEvent(event)
@@ -604,34 +614,10 @@ def rotate_keep_scale(
     *,
     resample,
 ) -> Image.Image:
-    """Rotate without angle-dependent apparent scaling (normalize by max side)."""
+    """Rotate image only; do not apply any post-rotation scaling."""
     src = img.convert("RGBA")
-    src_bbox = src.getchannel("A").getbbox()
-    if not src_bbox:
-        return src
-    _, _, sr, sb = src_bbox
-    src_w = max(1, sr - src_bbox[0])
-    src_h = max(1, sb - src_bbox[1])
-    src_area = float(max(1, src_w * src_h))
-
     out = src.rotate(angle_deg % 360, expand=True, resample=resample)
-    out = trim_alpha_border(out)
-    out_bbox = out.getchannel("A").getbbox()
-    if not out_bbox:
-        return out
-    _, _, or_, ob = out_bbox
-    out_w = max(1, or_ - out_bbox[0])
-    out_h = max(1, ob - out_bbox[1])
-    out_area = float(max(1, out_w * out_h))
-    if out_area <= 0:
-        return out
-    # Keep apparent size stable under rotation by preserving alpha-bbox area.
-    scale = (src_area / out_area) ** 0.5
-    if abs(scale - 1.0) < 1e-6:
-        return out
-    nw = max(1, int(round(out.width * scale)))
-    nh = max(1, int(round(out.height * scale)))
-    return out.resize((nw, nh), Image.Resampling.LANCZOS)
+    return trim_alpha_border(out)
 
 
 def place_mark(
@@ -663,18 +649,29 @@ def place_mark(
     if constrain_inside:
         x = max(bx, min(bx + bw - m.width, x))
         y = max(by, min(by + bh - m.height, y))
+    elif constrain_bounds is not None:
+        # Allow complete move-out but keep motion bounded by preview viewport.
+        x = max(bx - m.width, min(bx + bw, x))
+        y = max(by - m.height, min(by + bh, y))
     return m, x, y
 
 
 def apply_watermark(img: Image.Image, wm: Image.Image, cfg: WatermarkConfig) -> Image.Image:
     base = img.convert("RGBA")
     mark = wm.convert("RGBA")
+    base_rotate = int(getattr(cfg, "wm_base_rotate", 0)) % 360
+    base_opacity = max(1, min(100, int(getattr(cfg, "wm_base_opacity", 100))))
+    if base_rotate:
+        mark = rotate_keep_scale(mark, base_rotate, resample=Image.Resampling.BICUBIC)
+    if base_opacity < 100:
+        alpha = mark.getchannel("A").point(lambda x: int(x * base_opacity / 100))
+        mark.putalpha(alpha)
 
     target_w = max(8, int(base.width * cfg.scale_pct / 100))
     ratio = target_w / mark.width
     target_h = max(8, int(mark.height * ratio))
     mark = mark.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    mark = rotate_keep_scale(mark, cfg.rotate_deg, resample=Image.Resampling.BICUBIC)
+    mark = rotate_keep_scale(mark, int(cfg.rotate_deg) % 360, resample=Image.Resampling.BICUBIC)
 
     if cfg.opacity_pct < 100:
         alpha = mark.getchannel("A").point(lambda x: int(x * cfg.opacity_pct / 100))
@@ -686,7 +683,7 @@ def apply_watermark(img: Image.Image, wm: Image.Image, cfg: WatermarkConfig) -> 
         mark,
         cfg.x_pct,
         cfg.y_pct,
-        True,
+        cfg.constrain_inside,
     )
 
     layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -707,6 +704,7 @@ class MainWindow(QMainWindow):
         self.export_root = self.root / "export_images"
         self.watermark_root = self.root / "watermark_library" / "images"
         self.config_root = self.root / "watermark_library" / "configs"
+        self.wm_settings_path = self.root / "watermark_library" / "wm_settings.json"
         self.index_path = self.root / "internal_library" / "md5_index.json"
         self.settings_path = self.root / "app_settings.json"
 
@@ -731,9 +729,15 @@ class MainWindow(QMainWindow):
         self._preview_debounce_timer.setSingleShot(True)
         self._preview_debounce_timer.timeout.connect(self.update_preview)
         self._preview_interval_normal_ms = 16
-        self._preview_interval_drag_ms = 33
+        self._preview_interval_drag_ms = 12
         self._preview_rendering = False
         self._preview_dirty = False
+        self._overlay_dragging = False
+        self._overlay_drag_accum_x = 0.0
+        self._overlay_drag_accum_y = 0.0
+        self._overlay_drag_idle_timer = QTimer(self)
+        self._overlay_drag_idle_timer.setSingleShot(True)
+        self._overlay_drag_idle_timer.timeout.connect(lambda: setattr(self, "_overlay_dragging", False))
         self._sample_preview_cache_key: Optional[Tuple[str, float, int, int]] = None
         self._sample_preview_cache_img: Optional[Image.Image] = None
         self._sample_preview_content_rect: Tuple[int, int, int, int] = (0, 0, 1, 1)
@@ -752,6 +756,26 @@ class MainWindow(QMainWindow):
         self._wm_border_user_modified = False
         self._fx_border_user_modified = False
         self._preview_windows: List[ImagePreviewDialog] = []
+        self._wm_settings_by_file: Dict[str, Dict[str, int]] = {}
+        raw_applied = load_json(self.wm_settings_path, {})
+        self._wm_applied_settings_by_file: Dict[str, Dict[str, int]] = {}
+        if isinstance(raw_applied, dict):
+            for k, v in raw_applied.items():
+                if not isinstance(k, str):
+                    continue
+                rotate = 0
+                opacity = 100
+                if isinstance(v, dict):
+                    rotate = int(v.get("rotate", 0))
+                    opacity = int(v.get("opacity", 100))
+                else:
+                    rotate = int(v)
+                self._wm_applied_settings_by_file[k] = {
+                    "rotate": rotate % 360,
+                    "opacity": max(1, min(100, opacity)),
+                }
+        self._wm_selector_last_file: str = ""
+        self._wm_selector_changing = False
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -1659,15 +1683,15 @@ class MainWindow(QMainWindow):
 
         setting_box = QGroupBox("水印设置")
         setting_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        setting_box.setFixedHeight(210)
         setting_layout = QGridLayout(setting_box)
+        setting_layout.setContentsMargins(9, 9, 9, 9)
         setting_layout.setHorizontalSpacing(8)
         setting_layout.setVerticalSpacing(8)
 
         self.wm_selector = QComboBox()
-        self.wm_selector.setIconSize(QSize(44, 44))
+        self.wm_selector.setIconSize(QSize(52, 52))
         wm_view = QListView()
-        wm_view.setIconSize(QSize(44, 44))
+        wm_view.setIconSize(QSize(52, 52))
         wm_view.setSpacing(4)
         self.wm_selector.setView(wm_view)
         self.wm_selector.setItemDelegate(WatermarkComboDelegate(self.wm_selector))
@@ -1675,10 +1699,15 @@ class MainWindow(QMainWindow):
 
         self.wm_rotate_slider = self._make_slider(-999999, 999999, 0, self.update_preview)
         self.wm_opacity_slider = self._make_slider(1, 100, 100, self.update_preview)
+        self.wm_rotate_slider.valueChanged.connect(self._on_wm_setting_value_changed)
+        self.wm_opacity_slider.valueChanged.connect(self._on_wm_setting_value_changed)
+        self.wm_rotate_slider.editingFinished.connect(self._on_wm_rotate_edit_finished)
         self.show_border_checkbox = QCheckBox("显示边框")
         self.show_border_checkbox.setChecked(False)
         self.show_border_checkbox.toggled.connect(self.update_preview)
         row_h = self.wm_rotate_slider.sizeHint().height()
+        self.wm_rotate_slider.setFixedHeight(row_h)
+        self.wm_opacity_slider.setFixedHeight(row_h)
         self.wm_selector.setFixedHeight(row_h)
         self.show_border_checkbox.setFixedHeight(row_h)
 
@@ -1696,6 +1725,9 @@ class MainWindow(QMainWindow):
         setting_layout.addWidget(self.wm_rotate_slider, 1, 1, 1, 3)
         setting_layout.addWidget(QLabel("透明度(%)"), 2, 0)
         setting_layout.addWidget(self.wm_opacity_slider, 2, 1, 1, 3)
+        setting_layout.setRowMinimumHeight(0, row_h)
+        setting_layout.setRowMinimumHeight(1, row_h)
+        setting_layout.setRowMinimumHeight(2, row_h)
 
         btn_apply = QPushButton("应用")
         btn_apply.clicked.connect(self.apply_wm_settings)
@@ -1703,22 +1735,34 @@ class MainWindow(QMainWindow):
         btn_reset.clicked.connect(self.reset_wm_settings)
         btn_delete = QPushButton("删除")
         btn_delete.clicked.connect(self.delete_selected_watermark)
-        setting_layout.addWidget(btn_apply, 3, 1)
-        setting_layout.addWidget(btn_reset, 3, 2)
-        setting_layout.addWidget(btn_delete, 3, 3)
+        wm_btn_row = QHBoxLayout()
+        self._normalize_row_spacing(wm_btn_row)
+        wm_btn_row.addWidget(btn_apply)
+        wm_btn_row.addWidget(btn_reset)
+        wm_btn_row.addWidget(btn_delete)
+        wm_btn_wrap = QWidget()
+        wm_btn_wrap.setLayout(wm_btn_row)
+        wm_btn_wrap.setFixedHeight(row_h)
+        setting_layout.addWidget(wm_btn_wrap, 3, 1, 1, 3)
+        setting_layout.setRowMinimumHeight(3, row_h)
+        setting_box.setFixedHeight(setting_box.sizeHint().height())
         left_col.addWidget(setting_box)
 
         cfg_box = QGroupBox("配置设置")
         cfg_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        cfg_box.setFixedHeight(330)
+        cfg_box.setFixedHeight(362)
         cfg_layout = QGridLayout(cfg_box)
 
         self.cfg_name = QLineEdit("")
-        self.final_x_slider = self._make_slider(0, 100, 50, self.update_preview)
-        self.final_y_slider = self._make_slider(0, 100, 50, self.update_preview)
+        self.final_x_slider = self._make_slider(-100, 200, 50, self.update_preview)
+        self.final_y_slider = self._make_slider(-100, 200, 50, self.update_preview)
         self.final_scale_slider = self._make_slider(5, 100, 25, self.update_preview)
         self.final_rotate_slider = self._make_slider(-999999, 999999, 0, self.update_preview)
         self.final_opacity_slider = self._make_slider(1, 100, 100, self.update_preview)
+        self.final_rotate_slider.editingFinished.connect(self._on_final_rotate_edit_finished)
+        self.final_constrain_inside_checkbox = QCheckBox("限制水印在图像范围内")
+        self.final_constrain_inside_checkbox.setChecked(True)
+        self.final_constrain_inside_checkbox.toggled.connect(self._on_constrain_inside_toggled)
         self.config_selector = QComboBox()
         self.config_selector.currentIndexChanged.connect(self.load_selected_config)
         self._preview_sliders = [
@@ -1745,8 +1789,9 @@ class MainWindow(QMainWindow):
         cfg_layout.addWidget(self.final_rotate_slider, 4, 1, 1, 3)
         cfg_layout.addWidget(QLabel("透明度(%)"), 5, 0)
         cfg_layout.addWidget(self.final_opacity_slider, 5, 1, 1, 3)
-        cfg_layout.addWidget(QLabel("配置列表"), 6, 0)
-        cfg_layout.addWidget(self.config_selector, 6, 1, 1, 3)
+        cfg_layout.addWidget(self.final_constrain_inside_checkbox, 6, 1, 1, 3)
+        cfg_layout.addWidget(QLabel("配置列表"), 7, 0)
+        cfg_layout.addWidget(self.config_selector, 7, 1, 1, 3)
 
         cfg_btn_row = QHBoxLayout()
         self._normalize_row_spacing(cfg_btn_row)
@@ -1764,7 +1809,7 @@ class MainWindow(QMainWindow):
         cfg_btn_row.addWidget(rename_cfg_btn)
         cfg_btn_wrap = QWidget()
         cfg_btn_wrap.setLayout(cfg_btn_row)
-        cfg_layout.addWidget(cfg_btn_wrap, 7, 1, 1, 3)
+        cfg_layout.addWidget(cfg_btn_wrap, 8, 1, 1, 3)
 
         sample_row = QHBoxLayout()
         self._normalize_row_spacing(sample_row)
@@ -1778,8 +1823,8 @@ class MainWindow(QMainWindow):
         sample_row.addWidget(export_preview_btn)
         sample_wrap = QWidget()
         sample_wrap.setLayout(sample_row)
-        cfg_layout.addWidget(QLabel("预览图片"), 8, 0)
-        cfg_layout.addWidget(sample_wrap, 8, 1, 1, 3)
+        cfg_layout.addWidget(QLabel("预览图片"), 9, 0)
+        cfg_layout.addWidget(sample_wrap, 9, 1, 1, 3)
 
         left_col.addWidget(cfg_box)
 
@@ -1797,6 +1842,7 @@ class MainWindow(QMainWindow):
         self.current_wm_preview.setMaximumHeight(96)
         self.current_wm_preview.setStyleSheet("border: 1px solid #999;")
         self.preview_label.overlayDragged.connect(self._on_effect_overlay_dragged)
+        self.preview_label.overlayDragStateChanged.connect(self._on_effect_overlay_drag_state_changed)
         self.current_wm_name = QLabel("当前水印名称")
         self.current_wm_name.setAlignment(Qt.AlignCenter)
         self.current_wm_name.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
@@ -1844,8 +1890,7 @@ class MainWindow(QMainWindow):
         self._preview_debounce_timer.start(self._preview_interval_for_state())
 
     def _is_preview_slider_active(self) -> bool:
-        # SpinBox has no drag state; keep preview in normal realtime mode.
-        return False
+        return self._overlay_dragging
 
     def _preview_interval_for_state(self) -> int:
         return self._preview_interval_drag_ms if self._is_preview_slider_active() else self._preview_interval_normal_ms
@@ -1863,6 +1908,95 @@ class MainWindow(QMainWindow):
         self.wm_rotate_slider.setValue(0)
         self.wm_opacity_slider.setValue(100)
 
+    def _save_wm_settings_for_file(self, wm_file: str) -> None:
+        if not wm_file:
+            return
+        self._wm_settings_by_file[wm_file] = {
+            "rotate": int(self.wm_rotate_slider.value()),
+            "opacity": int(self.wm_opacity_slider.value()),
+        }
+
+    def _save_applied_wm_settings_for_file(self, wm_file: str, rotate: int, opacity: int) -> None:
+        if not wm_file:
+            return
+        self._wm_applied_settings_by_file[wm_file] = {
+            "rotate": self._normalize_degree(rotate),
+            "opacity": max(1, min(100, int(opacity))),
+        }
+        self._persist_wm_applied_settings()
+
+    def _persist_wm_applied_settings(self) -> None:
+        save_json(self.wm_settings_path, self._wm_applied_settings_by_file)
+
+    def _get_applied_wm_rotate(self, wm_file: str) -> int:
+        if not wm_file:
+            return 0
+        data = self._wm_applied_settings_by_file.get(wm_file, {})
+        return self._normalize_degree(int(data.get("rotate", 0)))
+
+    def _get_applied_wm_opacity(self, wm_file: str) -> int:
+        if not wm_file:
+            return 100
+        data = self._wm_applied_settings_by_file.get(wm_file, {})
+        return max(1, min(100, int(data.get("opacity", 100))))
+
+    def _effective_wm_rotate_for_file(self, wm_file: str, delta_override: Optional[int] = None) -> int:
+        base_rotate = self._get_applied_wm_rotate(wm_file)
+        if delta_override is None:
+            selected = self._selected_wm_filename()
+            if wm_file and wm_file == selected:
+                delta = int(self.wm_rotate_slider.value())
+            else:
+                delta = int(self._wm_settings_by_file.get(wm_file, {}).get("rotate", 0))
+        else:
+            delta = int(delta_override)
+        return self._normalize_degree(base_rotate + delta)
+
+    def _effective_wm_opacity_for_file(self, wm_file: str, delta_override: Optional[int] = None) -> int:
+        if delta_override is None:
+            selected = self._selected_wm_filename()
+            if wm_file and wm_file == selected:
+                value = int(self.wm_opacity_slider.value())
+            else:
+                value = int(self._wm_settings_by_file.get(wm_file, {}).get("opacity", self._get_applied_wm_opacity(wm_file)))
+        else:
+            value = int(delta_override)
+        return max(1, min(100, value))
+
+    def _restore_wm_settings_for_file(self, wm_file: str) -> None:
+        if not wm_file:
+            return
+        data = self._wm_settings_by_file.get(wm_file)
+        if data is None:
+            data = {"rotate": 0, "opacity": self._get_applied_wm_opacity(wm_file)}
+            self._wm_settings_by_file[wm_file] = dict(data)
+        self.wm_rotate_slider.blockSignals(True)
+        self.wm_opacity_slider.blockSignals(True)
+        self.wm_rotate_slider.setValue(int(data.get("rotate", 0)))
+        self.wm_opacity_slider.setValue(int(data.get("opacity", 100)))
+        self.wm_rotate_slider.blockSignals(False)
+        self.wm_opacity_slider.blockSignals(False)
+
+    def _on_wm_setting_value_changed(self, _value: int) -> None:
+        if self._wm_selector_changing:
+            return
+        wm_file = self._selected_wm_filename()
+        if wm_file:
+            self._save_wm_settings_for_file(wm_file)
+
+    def _reset_wm_settings_to_last_applied(self, wm_file: str) -> None:
+        if not wm_file:
+            self._reset_wm_setting_sliders()
+            return
+        applied_opacity = self._get_applied_wm_opacity(wm_file)
+        self.wm_rotate_slider.blockSignals(True)
+        self.wm_opacity_slider.blockSignals(True)
+        self.wm_rotate_slider.setValue(0)
+        self.wm_opacity_slider.setValue(applied_opacity)
+        self.wm_rotate_slider.blockSignals(False)
+        self.wm_opacity_slider.blockSignals(False)
+        self._save_wm_settings_for_file(wm_file)
+
     def delete_selected_watermark(self) -> None:
         feature_delete_selected_watermark(self)
 
@@ -1872,7 +2006,7 @@ class MainWindow(QMainWindow):
             return data
         return self.wm_selector.currentText().strip()
 
-    def _make_wm_selector_icon(self, p: Path, size: int = 44) -> QIcon:
+    def _make_wm_selector_icon(self, p: Path, size: int = 52) -> QIcon:
         pix = QPixmap(str(p))
         if pix.isNull():
             return QIcon()
@@ -1931,15 +2065,130 @@ class MainWindow(QMainWindow):
 
     def _apply_watermark_image_settings(self, wm_img: Image.Image, fast_mode: bool = False) -> Image.Image:
         # Watermark settings: process the watermark image itself.
+        wm_file = self._selected_wm_filename()
         mark = wm_img.convert("RGBA")
         rotate_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.BICUBIC
-        mark = rotate_keep_scale(mark, self.wm_rotate_slider.value(), resample=rotate_resample)
-
-        op = self.wm_opacity_slider.value()
+        mark = rotate_keep_scale(mark, self._effective_wm_rotate_for_file(wm_file), resample=rotate_resample)
+        op = self._effective_wm_opacity_for_file(wm_file)
         if op < 100:
             alpha = mark.getchannel("A").point(lambda x: int(x * op / 100))
             mark.putalpha(alpha)
         return mark
+
+    @staticmethod
+    def _normalize_degree(v: int) -> int:
+        return int(v) % 360
+
+    def _normalize_degree_spin(self, spin: QSpinBox) -> None:
+        deg = self._normalize_degree(spin.value())
+        if spin.value() == deg:
+            return
+        spin.blockSignals(True)
+        spin.setValue(deg)
+        spin.blockSignals(False)
+
+    def _build_effect_mark(
+        self,
+        base: Image.Image,
+        wm_layer: Image.Image,
+        *,
+        fast_mode: bool,
+        final_rotate_override: Optional[int],
+        wm_setting_rotate_deg: int = 0,
+        wm_setting_opacity_pct: int = 100,
+    ) -> Image.Image:
+        mark = wm_layer.convert("RGBA")
+        resize_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.LANCZOS
+        rotate_resample = Image.Resampling.BICUBIC
+        target_w = max(8, int(base.width * self.final_scale_slider.value() / 100))
+        ratio = target_w / max(1, mark.width)
+        target_h = max(8, int(mark.height * ratio))
+        mark = mark.resize((target_w, target_h), resize_resample)
+        rotate_deg = self.final_rotate_slider.value() if final_rotate_override is None else int(final_rotate_override)
+        total_rotate = self._normalize_degree(int(wm_setting_rotate_deg) + int(rotate_deg))
+        mark = rotate_keep_scale(mark, total_rotate, resample=rotate_resample)
+        wm_opacity = max(1, min(100, int(wm_setting_opacity_pct)))
+        final_opacity = max(1, min(100, int(self.final_opacity_slider.value())))
+        op = int(round(wm_opacity * final_opacity / 100.0))
+        op = max(1, min(100, op))
+        if op < 100:
+            alpha = mark.getchannel("A").point(lambda x: int(x * op / 100))
+            mark.putalpha(alpha)
+        return mark
+
+    @staticmethod
+    def _calc_pct_range_for_bounds(mark_len: int, bounds_len: int, constrain_inside: bool) -> Tuple[int, int]:
+        b = max(1, int(bounds_len))
+        m = max(1, int(mark_len))
+        if constrain_inside:
+            min_pct = int(round((m * 50.0) / b))
+            max_pct = int(round(100.0 - (m * 50.0) / b))
+        else:
+            min_pct = int(round(-(m * 50.0) / b))
+            max_pct = int(round(100.0 + (m * 50.0) / b))
+        if min_pct > max_pct:
+            mid = int(round((min_pct + max_pct) / 2.0))
+            return (mid, mid)
+        return (min_pct, max_pct)
+
+    def _sync_xy_slider_ranges(
+        self,
+        base_img: Image.Image,
+        wm_layer: Image.Image,
+        base_content_rect: Tuple[int, int, int, int],
+        *,
+        fast_mode: bool,
+        preserve_center_px: Optional[Tuple[float, float]] = None,
+        wm_setting_rotate_deg: int = 0,
+        wm_setting_opacity_pct: int = 100,
+    ) -> None:
+        constrain_inside = self.final_constrain_inside_checkbox.isChecked()
+        mark = self._build_effect_mark(
+            base_img,
+            wm_layer,
+            fast_mode=fast_mode,
+            final_rotate_override=None,
+            wm_setting_rotate_deg=wm_setting_rotate_deg,
+            wm_setting_opacity_pct=wm_setting_opacity_pct,
+        )
+        if constrain_inside:
+            _, _, bw_fit, bh_fit = base_content_rect
+            if mark.width > max(1, bw_fit) or mark.height > max(1, bh_fit):
+                fit_scale = min(
+                    max(1, bw_fit) / float(max(1, mark.width)),
+                    max(1, bh_fit) / float(max(1, mark.height)),
+                )
+                nw = max(1, int(round(mark.width * fit_scale)))
+                nh = max(1, int(round(mark.height * fit_scale)))
+                mark = mark.resize((nw, nh), Image.Resampling.LANCZOS)
+        _, _, bw, bh = (
+            base_content_rect
+            if constrain_inside
+            else (0, 0, base_img.width, base_img.height)
+        )
+        x_min, x_max = self._calc_pct_range_for_bounds(mark.width, bw, constrain_inside)
+        y_min, y_max = self._calc_pct_range_for_bounds(mark.height, bh, constrain_inside)
+        target_x = self.final_x_slider.value()
+        target_y = self.final_y_slider.value()
+        if preserve_center_px is not None:
+            cx, cy = preserve_center_px
+            bx, by, bw2, bh2 = (
+                base_content_rect
+                if constrain_inside
+                else (0, 0, base_img.width, base_img.height)
+            )
+            target_x = int(round((cx - bx) * 100.0 / float(max(1, bw2))))
+            target_y = int(round((cy - by) * 100.0 / float(max(1, bh2))))
+        target_x = max(x_min, min(x_max, target_x))
+        target_y = max(y_min, min(y_max, target_y))
+        self.final_x_slider.blockSignals(True)
+        self.final_y_slider.blockSignals(True)
+        self.final_x_slider.setRange(x_min, x_max)
+        self.final_y_slider.setRange(y_min, y_max)
+        self.final_x_slider.setValue(target_x)
+        self.final_y_slider.setValue(target_y)
+        self.final_x_slider.blockSignals(False)
+        self.final_y_slider.blockSignals(False)
 
     def _compose_effect_preview(
         self,
@@ -1949,32 +2198,30 @@ class MainWindow(QMainWindow):
         use_alpha_bbox: bool = False,
         final_rotate_override: Optional[int] = None,
         constrain_bounds: Optional[Tuple[int, int, int, int]] = None,
+        wm_setting_rotate_deg: int = 0,
+        wm_setting_opacity_pct: int = 100,
     ) -> Tuple[Image.Image, Tuple[float, float, float, float]]:
         # Preview-only composition: simulate two layers (base + watermark), no file write.
         base = base_img.convert("RGBA")
-        mark = wm_layer.convert("RGBA")
-        resize_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.LANCZOS
-        rotate_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.BICUBIC
+        mark = self._build_effect_mark(
+            base,
+            wm_layer,
+            fast_mode=fast_mode,
+            final_rotate_override=final_rotate_override,
+            wm_setting_rotate_deg=wm_setting_rotate_deg,
+            wm_setting_opacity_pct=wm_setting_opacity_pct,
+        )
 
-        target_w = max(8, int(base.width * self.final_scale_slider.value() / 100))
-        ratio = target_w / max(1, mark.width)
-        target_h = max(8, int(mark.height * ratio))
-        mark = mark.resize((target_w, target_h), resize_resample)
-        rotate_deg = self.final_rotate_slider.value() if final_rotate_override is None else int(final_rotate_override)
-        mark = rotate_keep_scale(mark, rotate_deg, resample=rotate_resample)
-
-        op = self.final_opacity_slider.value()
-        if op < 100:
-            alpha = mark.getchannel("A").point(lambda x: int(x * op / 100))
-            mark.putalpha(alpha)
-
+        constrain_inside = True
+        if hasattr(self, "final_constrain_inside_checkbox"):
+            constrain_inside = self.final_constrain_inside_checkbox.isChecked()
         mark, x, y = place_mark(
             base.width,
             base.height,
             mark,
             self.final_x_slider.value(),
             self.final_y_slider.value(),
-            True,
+            constrain_inside,
             constrain_bounds=constrain_bounds,
         )
 
@@ -2001,11 +2248,14 @@ class MainWindow(QMainWindow):
 
     def _get_cached_simulated_wm(self, wm_path: Path, fast_mode: bool) -> Image.Image:
         st = wm_path.stat()
+        wm_file = wm_path.name
+        eff_rotate = self._effective_wm_rotate_for_file(wm_file)
+        eff_opacity = self._effective_wm_opacity_for_file(wm_file)
         key = (
             str(wm_path),
             st.st_mtime,
-            self.wm_rotate_slider.value(),
-            self.wm_opacity_slider.value(),
+            eff_rotate,
+            eff_opacity,
             fast_mode,
         )
         if self._wm_sim_cache_key == key and self._wm_sim_cache_img is not None:
@@ -2114,16 +2364,141 @@ class MainWindow(QMainWindow):
         self.update_preview()
 
     def _on_wm_selector_changed(self, _idx: int) -> None:
+        if self._wm_selector_last_file:
+            self._save_wm_settings_for_file(self._wm_selector_last_file)
+        self._wm_selector_changing = True
+        try:
+            current_file = self._selected_wm_filename()
+            self._restore_wm_settings_for_file(current_file)
+            self._wm_selector_last_file = current_file
+        finally:
+            self._wm_selector_changing = False
         # New watermark should start with current frame aligned to actual frame.
         self._wm_current_border_norm = None
         self._fx_current_border_norm = None
         self.update_preview()
 
     def _on_effect_overlay_dragged(self, dx_norm: float, dy_norm: float) -> None:
-        x = self.final_x_slider.value() + int(round(dx_norm * 100))
-        y = self.final_y_slider.value() + int(round(dy_norm * 100))
-        self.final_x_slider.setValue(max(0, min(100, x)))
-        self.final_y_slider.setValue(max(0, min(100, y)))
+        base_w = 0
+        base_h = 0
+        if self._sample_preview_cache_img is not None:
+            base_w = int(self._sample_preview_cache_img.width)
+            base_h = int(self._sample_preview_cache_img.height)
+        bounds_w = base_w
+        bounds_h = base_h
+        if hasattr(self, "final_constrain_inside_checkbox") and self.final_constrain_inside_checkbox.isChecked():
+            _, _, bw, bh = self._sample_preview_content_rect
+            bounds_w = int(bw)
+            bounds_h = int(bh)
+        if bounds_w <= 0:
+            bounds_w = 1
+        if bounds_h <= 0:
+            bounds_h = 1
+        if base_w <= 0:
+            base_w = bounds_w
+        if base_h <= 0:
+            base_h = bounds_h
+        pct_step_x = 100.0 * (float(base_w) / float(bounds_w))
+        pct_step_y = 100.0 * (float(base_h) / float(bounds_h))
+        self._overlay_drag_accum_x += dx_norm * pct_step_x
+        self._overlay_drag_accum_y += dy_norm * pct_step_y
+        step_x = int(self._overlay_drag_accum_x) if self._overlay_drag_accum_x >= 0 else -int(-self._overlay_drag_accum_x)
+        step_y = int(self._overlay_drag_accum_y) if self._overlay_drag_accum_y >= 0 else -int(-self._overlay_drag_accum_y)
+        if step_x == 0 and step_y == 0:
+            return
+        self._overlay_drag_accum_x -= step_x
+        self._overlay_drag_accum_y -= step_y
+        x = self.final_x_slider.value() + step_x
+        y = self.final_y_slider.value() + step_y
+        x = max(self.final_x_slider.minimum(), min(self.final_x_slider.maximum(), x))
+        y = max(self.final_y_slider.minimum(), min(self.final_y_slider.maximum(), y))
+        changed = False
+        if x != self.final_x_slider.value():
+            self.final_x_slider.blockSignals(True)
+            self.final_x_slider.setValue(x)
+            self.final_x_slider.blockSignals(False)
+            changed = True
+        if y != self.final_y_slider.value():
+            self.final_y_slider.blockSignals(True)
+            self.final_y_slider.setValue(y)
+            self.final_y_slider.blockSignals(False)
+            changed = True
+        if changed:
+            self.request_preview_update()
+
+    def _on_effect_overlay_drag_state_changed(self, dragging: bool) -> None:
+        self._overlay_dragging = bool(dragging)
+        if dragging:
+            self._overlay_drag_accum_x = 0.0
+            self._overlay_drag_accum_y = 0.0
+            self._overlay_drag_idle_timer.stop()
+        else:
+            self._overlay_drag_accum_x = 0.0
+            self._overlay_drag_accum_y = 0.0
+            # Keep fast mode briefly while inertia-like queued updates are rendered.
+            self._overlay_drag_idle_timer.start(80)
+
+    def _on_wm_rotate_edit_finished(self) -> None:
+        self._normalize_degree_spin(self.wm_rotate_slider)
+        self.request_preview_update()
+
+    def _on_final_rotate_edit_finished(self) -> None:
+        self._normalize_degree_spin(self.final_rotate_slider)
+        self.request_preview_update()
+
+    def _on_constrain_inside_toggled(self, checked: bool) -> None:
+        # Remap current center to new constraint space to avoid tiny jumps on toggle.
+        wm_name = self._selected_wm_filename()
+        if not wm_name:
+            self.request_preview_update()
+            return
+        wm_path = self.watermark_root / wm_name
+        if not wm_path.exists():
+            self.request_preview_update()
+            return
+        try:
+            sample_path = Path(self.sample_image_line.text().strip()) if self.sample_image_line.text().strip() else self.default_preview_image
+            if not sample_path.exists() and self.default_preview_image.exists():
+                sample_path = self.default_preview_image
+            if not sample_path.exists():
+                self.request_preview_update()
+                return
+            tw = max(1, self.preview_label.width() - 8)
+            th = max(1, self.preview_label.height() - 8)
+            base_preview, base_content_rect = self._get_cached_sample_preview(sample_path, tw, th)
+            wm_processed = self._get_cached_simulated_wm(wm_path, fast_mode=True)
+            old_constrain = not bool(checked)
+            old_bounds = (
+                base_content_rect
+                if old_constrain
+                else (0, 0, base_preview.width, base_preview.height)
+            )
+            mark_old = self._build_effect_mark(
+                base_preview,
+                wm_processed,
+                fast_mode=True,
+                final_rotate_override=None,
+            )
+            mark_old, old_x, old_y = place_mark(
+                base_preview.width,
+                base_preview.height,
+                mark_old,
+                self.final_x_slider.value(),
+                self.final_y_slider.value(),
+                old_constrain,
+                constrain_bounds=old_bounds,
+            )
+            center_px = (old_x + mark_old.width * 0.5, old_y + mark_old.height * 0.5)
+            self._sync_xy_slider_ranges(
+                base_preview,
+                wm_processed,
+                base_content_rect,
+                fast_mode=True,
+                preserve_center_px=center_px,
+            )
+        except Exception:
+            pass
+        self.request_preview_update()
 
     def refresh_watermark_lists(self) -> None:
         feature_refresh_watermark_lists(self)
@@ -2141,32 +2516,36 @@ class MainWindow(QMainWindow):
         # Prefer restoring last saved values from selected config; fallback to defaults.
         cfg_name = self.config_selector.currentText().strip() if hasattr(self, "config_selector") else ""
         data = None
+        reset_source = "默认值"
         if cfg_name:
             data = load_json(self.config_root / f"{cfg_name}.json", None)
+            if isinstance(data, dict):
+                reset_source = f"已保存配置 {cfg_name}"
         if not data:
             name_from_input = self.cfg_name.text().strip()
             if name_from_input:
                 data = load_json(self.config_root / f"{name_from_input}.json", None)
+                if isinstance(data, dict):
+                    reset_source = f"已保存配置 {name_from_input}"
 
         if isinstance(data, dict):
             self.cfg_name.setText(str(data.get("name", cfg_name or self.cfg_name.text().strip())))
-            wm_file = str(data.get("watermark_file", ""))
-            if wm_file:
-                for i in range(self.wm_selector.count()):
-                    if self.wm_selector.itemData(i) == wm_file:
-                        self.wm_selector.setCurrentIndex(i)
-                        break
             self.final_x_slider.setValue(int(data.get("x_pct", 50)))
             self.final_y_slider.setValue(int(data.get("y_pct", 50)))
             self.final_scale_slider.setValue(int(data.get("scale_pct", 25)))
             self.final_rotate_slider.setValue(int(data.get("rotate_deg", 0)))
             self.final_opacity_slider.setValue(int(data.get("opacity_pct", 100)))
+            if hasattr(self, "final_constrain_inside_checkbox"):
+                self.final_constrain_inside_checkbox.setChecked(bool(data.get("constrain_inside", True)))
         else:
             self.final_x_slider.setValue(50)
             self.final_y_slider.setValue(50)
             self.final_scale_slider.setValue(25)
             self.final_rotate_slider.setValue(0)
             self.final_opacity_slider.setValue(100)
+            if hasattr(self, "final_constrain_inside_checkbox"):
+                self.final_constrain_inside_checkbox.setChecked(True)
+        self._log(self.wm_log, f"配置已重置: {reset_source}")
         self.update_preview()
 
     def delete_selected_config(self) -> None:
@@ -2265,14 +2644,18 @@ class MainWindow(QMainWindow):
             if wm_name:
                 wm_path = self.watermark_root / wm_name
                 if wm_path.exists():
-                    wm_processed = self._get_cached_simulated_wm(wm_path, fast_mode=False)
+                    wm_raw = self._get_cached_wm_raw(wm_path)
+                    wm_rotate = self._effective_wm_rotate_for_file(wm_name)
+                    wm_opacity = self._effective_wm_opacity_for_file(wm_name)
                     composed, _ = self._compose_effect_preview(
                         base,
-                        wm_processed,
+                        wm_raw,
                         fast_mode=False,
                         use_alpha_bbox=False,
                         final_rotate_override=None,
                         constrain_bounds=(0, 0, base.width, base.height),
+                        wm_setting_rotate_deg=wm_rotate,
+                        wm_setting_opacity_pct=wm_opacity,
                     )
                 else:
                     composed = base.convert("RGBA")
@@ -2325,19 +2708,29 @@ class MainWindow(QMainWindow):
             if wm_path is not None and wm_path.exists():
                 wm_raw_actual = self._get_cached_wm_raw(wm_path)
                 wm_processed_current = self._get_cached_simulated_wm(wm_path, fast_mode=fast_mode)
+                wm_effective_rotate = self._effective_wm_rotate_for_file(wm_name)
+                wm_effective_opacity = self._effective_wm_opacity_for_file(wm_name)
+                self._sync_xy_slider_ranges(
+                    base_preview,
+                    wm_raw_actual,
+                    base_content_rect,
+                    fast_mode=fast_mode,
+                    wm_setting_rotate_deg=wm_effective_rotate,
+                    wm_setting_opacity_pct=wm_effective_opacity,
+                )
                 wm_stat = wm_path.stat()
                 wm_thumb, wm_current_bbox_norm = self._get_cached_wm_preview_pix(
                     wm_processed_current,
                     max(1, self.current_wm_preview.width() - 2),
                     max(1, self.current_wm_preview.height() - 2),
-                    cache_tag=("wm_preview_current", str(wm_path), wm_stat.st_mtime, self.wm_rotate_slider.value(), self.wm_opacity_slider.value()),
+                    cache_tag=("wm_preview_current", str(wm_path), wm_stat.st_mtime, wm_effective_rotate, wm_effective_opacity),
                     use_alpha_bbox=True,
                 )
                 _, wm_actual_bbox_norm = self._get_cached_wm_preview_pix(
                     wm_processed_current,
                     max(1, self.current_wm_preview.width() - 2),
                     max(1, self.current_wm_preview.height() - 2),
-                    cache_tag=("wm_preview_actual", str(wm_path), wm_stat.st_mtime, self.wm_rotate_slider.value(), self.wm_opacity_slider.value()),
+                    cache_tag=("wm_preview_actual", str(wm_path), wm_stat.st_mtime, wm_effective_rotate, wm_effective_opacity),
                     use_alpha_bbox=False,
                 )
                 self._wm_actual_border_norm = wm_actual_bbox_norm
@@ -2352,11 +2745,17 @@ class MainWindow(QMainWindow):
                 # Two-layer simulation for effect preview; no persistent image data change.
                 effect_preview, self._fx_current_border_norm = self._compose_effect_preview(
                     base_preview,
-                    wm_processed_current,
+                    wm_raw_actual,
                     fast_mode=fast_mode,
                     use_alpha_bbox=False,
                     final_rotate_override=None,
-                    constrain_bounds=base_content_rect,
+                    constrain_bounds=(
+                        base_content_rect
+                        if self.final_constrain_inside_checkbox.isChecked()
+                        else (0, 0, base_preview.width, base_preview.height)
+                    ),
+                    wm_setting_rotate_deg=wm_effective_rotate,
+                    wm_setting_opacity_pct=wm_effective_opacity,
                 )
                 _, self._fx_actual_border_norm = self._compose_effect_preview(
                     base_preview,
@@ -2364,9 +2763,21 @@ class MainWindow(QMainWindow):
                     fast_mode=fast_mode,
                     use_alpha_bbox=False,
                     final_rotate_override=0,
-                    constrain_bounds=base_content_rect,
+                    constrain_bounds=(
+                        base_content_rect
+                        if self.final_constrain_inside_checkbox.isChecked()
+                        else (0, 0, base_preview.width, base_preview.height)
+                    ),
+                    wm_setting_rotate_deg=0,
+                    wm_setting_opacity_pct=100,
                 )
             else:
+                self.final_x_slider.blockSignals(True)
+                self.final_y_slider.blockSignals(True)
+                self.final_x_slider.setRange(-100, 200)
+                self.final_y_slider.setRange(-100, 200)
+                self.final_x_slider.blockSignals(False)
+                self.final_y_slider.blockSignals(False)
                 empty = self._render_checkerboard_preview(QPixmap(), max(1, self.current_wm_preview.width() - 2), max(1, self.current_wm_preview.height() - 2))
                 self.current_wm_preview.setPixmap(empty)
                 self.current_wm_preview.setText("当前水印预览")

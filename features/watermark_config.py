@@ -43,9 +43,15 @@ def add_watermark_file(ctx) -> None:
 
     shutil.copy2(src, dst)
     _trim_transparent_edges(dst)
+    if hasattr(ctx, "_save_applied_wm_settings_for_file"):
+        ctx._save_applied_wm_settings_for_file(dst.name, 0, 100)
     ctx._log(ctx.wm_log, f"已入库水印: {dst.name}")
     ctx.watermark_name_line.clear()
     ctx.refresh_watermark_lists()
+    for i in range(ctx.wm_selector.count()):
+        if ctx.wm_selector.itemData(i) == dst.name:
+            ctx.wm_selector.setCurrentIndex(i)
+            break
 
 
 def apply_wm_settings(ctx) -> None:
@@ -54,33 +60,32 @@ def apply_wm_settings(ctx) -> None:
         QMessageBox.information(ctx, "提示", "请先选择水印")
         return
 
-    wm_path = ctx.watermark_root / wm_file
-    if not wm_path.exists():
-        QMessageBox.warning(ctx, "错误", "水印文件不存在")
-        return
-
     try:
-        with Image.open(wm_path) as wm_raw:
-            wm_processed = ctx._apply_watermark_image_settings(wm_raw)
-        wm_processed.save(wm_path, format="PNG")
+        applied_rotate = int(ctx._effective_wm_rotate_for_file(wm_file))
+        applied_opacity = int(ctx._effective_wm_opacity_for_file(wm_file))
+        if hasattr(ctx, "_save_applied_wm_settings_for_file"):
+            ctx._save_applied_wm_settings_for_file(wm_file, applied_rotate, applied_opacity)
         _reset_wm_caches(ctx)
         ctx._wm_current_border_norm = None
         ctx._fx_current_border_norm = None
         ctx._reset_wm_setting_sliders()
-        ctx.refresh_watermark_lists()
-        # Force-keep current watermark selection after list refresh.
-        for i in range(ctx.wm_selector.count()):
-            if ctx.wm_selector.itemData(i) == wm_file:
-                ctx.wm_selector.setCurrentIndex(i)
-                break
+        # Keep opacity at the just-applied value; only rotation delta returns to 0.
+        if hasattr(ctx, "wm_opacity_slider"):
+            ctx.wm_opacity_slider.setValue(applied_opacity)
+        if hasattr(ctx, "_save_wm_settings_for_file"):
+            ctx._save_wm_settings_for_file(wm_file)
         ctx.update_preview()
-        ctx._log(ctx.wm_log, f"已应用并覆盖水印: {wm_path.name}")
+        ctx._log(ctx.wm_log, f"已应用水印设置(基于母版): {wm_file}")
     except Exception as e:
         QMessageBox.critical(ctx, "应用失败", f"{type(e).__name__}: {e}")
 
 
 def reset_wm_settings(ctx) -> None:
-    ctx._reset_wm_setting_sliders()
+    wm_file = ctx._selected_wm_filename()
+    if hasattr(ctx, "_reset_wm_settings_to_last_applied"):
+        ctx._reset_wm_settings_to_last_applied(wm_file)
+    else:
+        ctx._reset_wm_setting_sliders()
     ctx._wm_current_border_norm = None
     ctx._fx_current_border_norm = None
     ctx.update_preview()
@@ -110,6 +115,12 @@ def delete_selected_watermark(ctx) -> None:
 
     try:
         wm_path.unlink()
+        if hasattr(ctx, "_wm_applied_settings_by_file"):
+            ctx._wm_applied_settings_by_file.pop(wm_file, None)
+            if hasattr(ctx, "_persist_wm_applied_settings"):
+                ctx._persist_wm_applied_settings()
+        if hasattr(ctx, "_wm_settings_by_file"):
+            ctx._wm_settings_by_file.pop(wm_file, None)
         _reset_wm_caches(ctx)
         ctx._log(ctx.wm_log, f"已删除水印: {wm_path.name}")
         ctx.refresh_watermark_lists()
@@ -133,6 +144,7 @@ def refresh_watermark_lists(ctx) -> None:
 
     current_cfg = ctx.config_selector.currentText() if hasattr(ctx, "config_selector") else ""
     if hasattr(ctx, "config_selector"):
+        ctx.config_selector.blockSignals(True)
         ctx.config_selector.clear()
         for p in sorted(ctx.config_root.glob("*.json")):
             ctx.config_selector.addItem(p.stem)
@@ -140,6 +152,14 @@ def refresh_watermark_lists(ctx) -> None:
             idx = ctx.config_selector.findText(current_cfg)
             if idx >= 0:
                 ctx.config_selector.setCurrentIndex(idx)
+            else:
+                ctx.config_selector.setCurrentIndex(-1)
+        else:
+            # Do not auto-select first config on refresh; keep "default checked" behavior intact.
+            ctx.config_selector.setCurrentIndex(-1)
+        ctx.config_selector.blockSignals(False)
+        if not current_cfg and hasattr(ctx, "final_constrain_inside_checkbox"):
+            ctx.final_constrain_inside_checkbox.setChecked(True)
 
 
 def current_cfg_obj(ctx, watermark_config_cls: Type) -> Optional[object]:
@@ -156,7 +176,9 @@ def current_cfg_obj(ctx, watermark_config_cls: Type) -> Optional[object]:
         scale_pct=ctx.final_scale_slider.value(),
         rotate_deg=ctx.final_rotate_slider.value(),
         opacity_pct=ctx.final_opacity_slider.value(),
-        constrain_inside=True,
+        constrain_inside=bool(ctx.final_constrain_inside_checkbox.isChecked())
+        if hasattr(ctx, "final_constrain_inside_checkbox")
+        else True,
     )
 
 
@@ -169,12 +191,18 @@ def save_current_config(ctx, *, save_json: Callable[[Path, object], None], water
     save_json(ctx.config_root / f"{cfg.name}.json", asdict(cfg))
     ctx._log(ctx.wm_log, f"配置已保存: {cfg.name}")
     ctx.refresh_watermark_lists()
+    if hasattr(ctx, "config_selector"):
+        idx = ctx.config_selector.findText(cfg.name)
+        if idx >= 0:
+            ctx.config_selector.setCurrentIndex(idx)
     ctx.refresh_export_config_list()
 
 
 def load_selected_config(ctx, *, load_json: Callable[[Path, object], object]) -> None:
     name = ctx.config_selector.currentText().strip()
     if not name:
+        if hasattr(ctx, "final_constrain_inside_checkbox"):
+            ctx.final_constrain_inside_checkbox.setChecked(True)
         return
 
     data = load_json(ctx.config_root / f"{name}.json", None)
@@ -193,6 +221,8 @@ def load_selected_config(ctx, *, load_json: Callable[[Path, object], object]) ->
     ctx.final_scale_slider.setValue(int(data.get("scale_pct", 25)))
     ctx.final_rotate_slider.setValue(int(data.get("rotate_deg", 0)))
     ctx.final_opacity_slider.setValue(int(data.get("opacity_pct", 100)))
+    if hasattr(ctx, "final_constrain_inside_checkbox"):
+        ctx.final_constrain_inside_checkbox.setChecked(bool(data.get("constrain_inside", True)))
     ctx.update_preview()
 
 

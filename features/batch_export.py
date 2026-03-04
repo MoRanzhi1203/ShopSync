@@ -51,6 +51,14 @@ def batch_export(
         QMessageBox.warning(ctx, "错误", "配置文件读取失败")
         return
     cfg = watermark_config_cls(**cfg_data)
+    if hasattr(ctx, "_get_applied_wm_rotate"):
+        setattr(cfg, "wm_base_rotate", int(ctx._get_applied_wm_rotate(cfg.watermark_file)))
+    else:
+        setattr(cfg, "wm_base_rotate", 0)
+    if hasattr(ctx, "_get_applied_wm_opacity"):
+        setattr(cfg, "wm_base_opacity", int(ctx._get_applied_wm_opacity(cfg.watermark_file)))
+    else:
+        setattr(cfg, "wm_base_opacity", 100)
 
     wm_path = ctx.watermark_root / cfg.watermark_file
     if not wm_path.exists():
@@ -99,4 +107,3 @@ def batch_export(
                 ctx._log(ctx.export_log, f"{src_dir.name}: 警告，成功 {one_folder_ok} 张，不满足 16-20")
 
     ctx._log(ctx.export_log, f"批量完成: 合规文件夹 {ok_folder}，输出图片 {ok_img}")
-
