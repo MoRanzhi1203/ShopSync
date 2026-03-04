@@ -132,6 +132,126 @@ class ImagePreviewDialog(QDialog):
         self._refresh_pixmap()
 
 
+class GroupSortManagerDialog(QDialog):
+    def __init__(
+        self,
+        current_order: List[str],
+        default_order: List[str],
+        count_map: Dict[str, int],
+        ctime_map: Dict[str, float],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("分组排序管理")
+        self.resize(420, 520)
+        self.count_map = count_map
+        self.ctime_map = ctime_map
+        self.list_widget = QListWidget()
+        self.list_widget.setDragDropMode(QListWidget.InternalMove)
+        self.list_widget.setDefaultDropAction(Qt.MoveAction)
+        for n in current_order:
+            self.list_widget.addItem(n)
+        if self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(0)
+
+        btn_up = QPushButton("上移")
+        btn_down = QPushButton("下移")
+        btn_top = QPushButton("置顶")
+        btn_bottom = QPushButton("置底")
+        btn_count_asc = QPushButton("按数量升序")
+        btn_count_desc = QPushButton("按数量降序")
+        btn_reset = QPushButton("恢复默认(创建时间)")
+        btn_ok = QPushButton("保存")
+        btn_cancel = QPushButton("取消")
+
+        btn_up.clicked.connect(lambda: self._move_current(-1))
+        btn_down.clicked.connect(lambda: self._move_current(1))
+        btn_top.clicked.connect(self._move_top)
+        btn_bottom.clicked.connect(self._move_bottom)
+        btn_count_asc.clicked.connect(lambda: self._sort_by_count(False))
+        btn_count_desc.clicked.connect(lambda: self._sort_by_count(True))
+        btn_reset.clicked.connect(lambda: self._reset(default_order))
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.setSpacing(8)
+        row1.addWidget(btn_up)
+        row1.addWidget(btn_down)
+        row1.addWidget(btn_top)
+        row1.addWidget(btn_bottom)
+
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(8)
+        row2.addWidget(btn_count_asc)
+        row2.addWidget(btn_count_desc)
+        row2.addStretch(1)
+
+        row3 = QHBoxLayout()
+        row3.setContentsMargins(0, 0, 0, 0)
+        row3.setSpacing(8)
+        row2.addWidget(btn_reset)
+        row3.addStretch(1)
+        row3.addWidget(btn_ok)
+        row3.addWidget(btn_cancel)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.list_widget)
+        lay.addLayout(row1)
+        lay.addLayout(row2)
+        lay.addLayout(row3)
+
+    def _move_current(self, delta: int) -> None:
+        row = self.list_widget.currentRow()
+        if row < 0:
+            return
+        target = row + delta
+        if target < 0 or target >= self.list_widget.count():
+            return
+        item = self.list_widget.takeItem(row)
+        self.list_widget.insertItem(target, item)
+        self.list_widget.setCurrentRow(target)
+
+    def _move_top(self) -> None:
+        row = self.list_widget.currentRow()
+        if row <= 0:
+            return
+        item = self.list_widget.takeItem(row)
+        self.list_widget.insertItem(0, item)
+        self.list_widget.setCurrentRow(0)
+
+    def _move_bottom(self) -> None:
+        row = self.list_widget.currentRow()
+        if row < 0 or row >= self.list_widget.count() - 1:
+            return
+        item = self.list_widget.takeItem(row)
+        self.list_widget.addItem(item)
+        self.list_widget.setCurrentRow(self.list_widget.count() - 1)
+
+    def _reset(self, default_order: List[str]) -> None:
+        self.list_widget.clear()
+        for n in default_order:
+            self.list_widget.addItem(n)
+        if self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(0)
+
+    def _sort_by_count(self, desc: bool) -> None:
+        names = self.get_order()
+        names.sort(
+            key=lambda n: (
+                -self.count_map.get(n, 0) if desc else self.count_map.get(n, 0),
+                self.ctime_map.get(n, 0.0),
+                n.lower(),
+            )
+        )
+        self._reset(names)
+
+    def get_order(self) -> List[str]:
+        return [self.list_widget.item(i).text() for i in range(self.list_widget.count())]
+
+
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -308,7 +428,7 @@ class MainWindow(QMainWindow):
             ensure_dir(p)
 
         self.md5_index: Dict[str, str] = load_json(self.index_path, {})
-        self.app_settings: Dict[str, str] = load_json(self.settings_path, {})
+        self.app_settings: Dict[str, object] = load_json(self.settings_path, {})
         self.candidate_images: List[Path] = []
         self.current_internal_group_dir: Optional[Path] = None
         self._pending_group_dir: Optional[Path] = None
@@ -356,6 +476,11 @@ class MainWindow(QMainWindow):
         if p:
             line.setText(p)
 
+    def _normalize_row_spacing(self, row_layout: QHBoxLayout) -> None:
+        # Keep row spacing consistent across the app without changing overall layout structure.
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+
     def _build_import_tab(self) -> None:
         layout = QVBoxLayout(self.import_tab)
 
@@ -364,6 +489,7 @@ class MainWindow(QMainWindow):
         pick_btn = QPushButton("选择目录")
         pick_btn.clicked.connect(lambda: self._pick_dir(self.src_import_line))
         row = QHBoxLayout()
+        self._normalize_row_spacing(row)
         row.addWidget(self.src_import_line)
         row.addWidget(pick_btn)
         w = QWidget()
@@ -394,6 +520,7 @@ class MainWindow(QMainWindow):
         mid_col = QVBoxLayout()
         mid_col.addWidget(QLabel("分组文件"))
         mode_row = QHBoxLayout()
+        self._normalize_row_spacing(mode_row)
         mode_row.addWidget(QLabel("显示模式"))
         self.internal_file_view_mode = QComboBox()
         self.internal_file_view_mode.addItems(["详细信息", "大图标"])
@@ -449,15 +576,104 @@ class MainWindow(QMainWindow):
     def _collect_internal_group_info(self) -> Tuple[List[Tuple[Path, int]], int]:
         groups: List[Tuple[Path, int]] = []
         total_images = 0
-        if not self.internal_root.exists():
-            return groups, total_images
-        for d in sorted(self.internal_root.iterdir()):
-            if not d.is_dir():
-                continue
+        for d in self._get_ordered_internal_group_dirs():
             cnt = len([p for p in d.iterdir() if is_image_file(p)])
             groups.append((d, cnt))
             total_images += cnt
         return groups, total_images
+
+    def _group_ctime(self, d: Path) -> float:
+        try:
+            return d.stat().st_ctime
+        except Exception:
+            return 0.0
+
+    def _default_internal_group_order(self) -> List[Path]:
+        if not self.internal_root.exists():
+            return []
+        dirs = [d for d in self.internal_root.iterdir() if d.is_dir()]
+        return sorted(dirs, key=lambda p: (self._group_ctime(p), p.name.lower()))
+
+    def _is_empty_group(self, group_dir: Path) -> bool:
+        if not group_dir.exists() or not group_dir.is_dir():
+            return False
+        has_images = any(is_image_file(p) for p in group_dir.iterdir() if p.is_file())
+        has_subdirs = any(p.is_dir() for p in group_dir.iterdir())
+        has_other_files = any(p.is_file() for p in group_dir.iterdir() if not is_image_file(p))
+        return (not has_images) and (not has_subdirs) and (not has_other_files)
+
+    def _group_count_map(self) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        if not self.internal_root.exists():
+            return out
+        for d in self.internal_root.iterdir():
+            if not d.is_dir():
+                continue
+            out[d.name] = len([p for p in d.iterdir() if is_image_file(p)])
+        return out
+
+    def _group_ctime_map(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        if not self.internal_root.exists():
+            return out
+        for d in self.internal_root.iterdir():
+            if not d.is_dir():
+                continue
+            out[d.name] = self._group_ctime(d)
+        return out
+
+    def _get_custom_group_order(self) -> List[str]:
+        val = self.app_settings.get("internal_group_order", [])
+        if isinstance(val, list):
+            return [str(x) for x in val if isinstance(x, str)]
+        return []
+
+    def _set_custom_group_order(self, order: List[str]) -> None:
+        self.app_settings["internal_group_order"] = order
+        save_json(self.settings_path, self.app_settings)
+
+    def _get_ordered_internal_group_dirs(self) -> List[Path]:
+        default_dirs = self._default_internal_group_order()
+        name_to_dir = {d.name: d for d in default_dirs}
+        custom_names = [n for n in self._get_custom_group_order() if n in name_to_dir]
+        custom_set = set(custom_names)
+        ordered = [name_to_dir[n] for n in custom_names] + [d for d in default_dirs if d.name not in custom_set]
+        normalized = [d.name for d in ordered]
+        if normalized != self._get_custom_group_order():
+            self._set_custom_group_order(normalized)
+        return ordered
+
+    def move_group_order(self, group_name: str, action: str) -> None:
+        order = [d.name for d in self._get_ordered_internal_group_dirs()]
+        if group_name not in order:
+            return
+        i = order.index(group_name)
+        if action == "up" and i > 0:
+            order[i - 1], order[i] = order[i], order[i - 1]
+        elif action == "down" and i < len(order) - 1:
+            order[i + 1], order[i] = order[i], order[i + 1]
+        elif action == "top" and i > 0:
+            order.insert(0, order.pop(i))
+        elif action == "bottom" and i < len(order) - 1:
+            order.append(order.pop(i))
+        else:
+            return
+        self._set_custom_group_order(order)
+        self.refresh_internal_group_list()
+        self.select_internal_group(self.internal_root / group_name)
+
+    def open_group_sort_manager(self) -> None:
+        current = [d.name for d in self._get_ordered_internal_group_dirs()]
+        default = [d.name for d in self._default_internal_group_order()]
+        if not current:
+            QMessageBox.information(self, "提示", "当前没有可排序分组")
+            return
+        dlg = GroupSortManagerDialog(current, default, self._group_count_map(), self._group_ctime_map(), self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        order = dlg.get_order()
+        self._set_custom_group_order(order)
+        self.refresh_internal_group_list()
 
     def _update_internal_group_stats(self, group_count: int, total_images: int) -> None:
         self.internal_group_stats_label.setText(f"分组: {group_count}  |  总图片: {total_images}")
@@ -527,11 +743,14 @@ class MainWindow(QMainWindow):
             menu = QMenu(self)
             act_create = menu.addAction("创建新分组")
             act_clear_empty = menu.addAction("清除空分组")
+            act_sort_mgr = menu.addAction("排序管理")
             chosen = menu.exec_(self.internal_group_list.mapToGlobal(pos))
             if chosen == act_create:
                 self.create_internal_group()
             if chosen == act_clear_empty:
                 self.clear_empty_groups()
+            if chosen == act_sort_mgr:
+                self.open_group_sort_manager()
             return
         raw = item.data(Qt.UserRole)
         if not raw:
@@ -543,7 +762,13 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         act_rename = menu.addAction("重命名分组")
         act_delete = menu.addAction("删除分组")
-        act_clear_empty = menu.addAction("清除空分组")
+        act_clear_empty = menu.addAction("清除空分组") if self._is_empty_group(group_dir) else None
+        menu.addSeparator()
+        act_move_up = menu.addAction("排序上移")
+        act_move_down = menu.addAction("排序下移")
+        act_move_top = menu.addAction("排序置顶")
+        act_move_bottom = menu.addAction("排序置底")
+        act_sort_mgr = menu.addAction("排序管理")
         chosen = menu.exec_(self.internal_group_list.mapToGlobal(pos))
         if chosen is None:
             return
@@ -553,8 +778,23 @@ class MainWindow(QMainWindow):
         if chosen == act_delete:
             self.delete_internal_group(group_dir)
             return
-        if chosen == act_clear_empty:
+        if act_clear_empty is not None and chosen == act_clear_empty:
             self.clear_empty_groups()
+            return
+        if chosen == act_move_up:
+            self.move_group_order(group_dir.name, "up")
+            return
+        if chosen == act_move_down:
+            self.move_group_order(group_dir.name, "down")
+            return
+        if chosen == act_move_top:
+            self.move_group_order(group_dir.name, "top")
+            return
+        if chosen == act_move_bottom:
+            self.move_group_order(group_dir.name, "bottom")
+            return
+        if chosen == act_sort_mgr:
+            self.open_group_sort_manager()
             return
 
     def create_internal_group(self) -> None:
@@ -574,6 +814,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "错误", f"分组已存在: {name}")
             return
         ensure_dir(target)
+        cur_order = self._get_custom_group_order()
+        if name not in cur_order:
+            cur_order.append(name)
+            self._set_custom_group_order(cur_order)
         self._log(self.import_log, f"已创建新分组: {name}")
         self.refresh_internal_group_list()
         self.select_internal_group(target)
@@ -654,6 +898,10 @@ class MainWindow(QMainWindow):
                 tmp.rename(final)
 
             self._remap_md5_index_paths(old_dir, new_dir)
+            order = self._get_custom_group_order()
+            if old_name in order:
+                order[order.index(old_name)] = new_name
+                self._set_custom_group_order(order)
             self._log(self.import_log, f"分组重命名: {old_name} -> {new_name}，并同步重命名 {len(temp_files)} 个文件")
             self.refresh_internal_group_list()
             self.select_internal_group(new_dir)
@@ -683,6 +931,8 @@ class MainWindow(QMainWindow):
                 if not str(v).replace("\\", "/").startswith(prefix)
             }
             save_json(self.index_path, self.md5_index)
+            order = [n for n in self._get_custom_group_order() if n != name]
+            self._set_custom_group_order(order)
             self._log(self.import_log, f"分组已删除: {name}")
             self.refresh_internal_group_list()
         except Exception as e:
@@ -1127,6 +1377,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(cfg)
 
         btn_row = QHBoxLayout()
+        self._normalize_row_spacing(btn_row)
         self.btn_pick_candidates = QPushButton("随机抽样并打乱")
         self.btn_pick_candidates.clicked.connect(self.pick_candidates)
         self.btn_build_second = QPushButton("按勾选生成商品图分组")
@@ -1233,6 +1484,7 @@ class MainWindow(QMainWindow):
         top_box = QGroupBox("水印库")
         top_layout = QFormLayout(top_box)
         wm_row = QHBoxLayout()
+        self._normalize_row_spacing(wm_row)
         self.watermark_file_line = QLineEdit()
         pick_wm = QPushButton("选择PNG")
         pick_wm.clicked.connect(lambda: self._pick_file(self.watermark_file_line, "PNG Files (*.png)"))
@@ -1276,6 +1528,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(cfg_box)
 
         sample_row = QHBoxLayout()
+        self._normalize_row_spacing(sample_row)
         self.sample_image_line = QLineEdit()
         pick_sample = QPushButton("选择预览底图")
         pick_sample.clicked.connect(lambda: self._pick_file(self.sample_image_line, "Image Files (*.png *.jpg *.jpeg *.webp *.bmp)"))
@@ -1286,6 +1539,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(sample_w)
 
         btn_row = QHBoxLayout()
+        self._normalize_row_spacing(btn_row)
         self.config_selector = QComboBox()
         self.config_selector.currentIndexChanged.connect(self.load_selected_config)
         save_btn = QPushButton("保存配置")
@@ -1422,6 +1676,7 @@ class MainWindow(QMainWindow):
         btn1 = QPushButton("选择商品图分组目录")
         btn1.clicked.connect(lambda: self._pick_dir(self.second_line))
         row1 = QHBoxLayout()
+        self._normalize_row_spacing(row1)
         row1.addWidget(self.second_line)
         row1.addWidget(btn1)
         w1 = QWidget()
@@ -1432,6 +1687,7 @@ class MainWindow(QMainWindow):
         btn2 = QPushButton("选择导出目录")
         btn2.clicked.connect(lambda: self._pick_dir(self.export_line))
         row2 = QHBoxLayout()
+        self._normalize_row_spacing(row2)
         row2.addWidget(self.export_line)
         row2.addWidget(btn2)
         w2 = QWidget()
@@ -1443,6 +1699,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(folder_box)
 
         btn_row = QHBoxLayout()
+        self._normalize_row_spacing(btn_row)
         refresh_btn = QPushButton("刷新文件夹与配置")
         refresh_btn.clicked.connect(self.refresh_export_folder_list)
         run_btn = QPushButton("按配置批量加水印并出图")
