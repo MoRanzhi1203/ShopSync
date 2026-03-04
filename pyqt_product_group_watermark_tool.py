@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import hashlib
+import io
 import json
 import random
 import shutil
@@ -28,6 +29,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressDialog,
     QSpinBox,
     QTabWidget,
     QTextEdit,
@@ -40,6 +42,7 @@ from PyQt5.QtWidgets import (
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+MAX_IMPORT_IMAGE_BYTES = 2 * 1024 * 1024
 
 
 @dataclass
@@ -57,7 +60,7 @@ class ThumbnailWorker(QObject):
     thumbnail_ready = pyqtSignal(int, QIcon)
     finished = pyqtSignal()
 
-    def __init__(self, files: List[Path], thumb_w: int = 200, thumb_h: int = 120) -> None:
+    def __init__(self, files: List[Path], thumb_w: int = 176, thumb_h: int = 102) -> None:
         super().__init__()
         self.files = files
         self.thumb_w = thumb_w
@@ -75,7 +78,7 @@ class ThumbnailWorker(QObject):
                 try:
                     with Image.open(path) as im:
                         rgb = im.convert("RGB")
-                        # Keep original aspect ratio (no crop), pad remaining space.
+                        # Keep original ratio and pad to a smaller unified canvas.
                         fitted = ImageOps.contain(
                             rgb,
                             (self.thumb_w, self.thumb_h),
@@ -126,6 +129,61 @@ def md5_of_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
                 break
             m.update(chunk)
     return m.hexdigest()
+
+
+def _encode_jpg_bytes(img: Image.Image, quality: int) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
+    return buf.getvalue()
+
+
+def compress_image_to_under_2mb(src: Path, dst: Path, max_bytes: int = MAX_IMPORT_IMAGE_BYTES) -> Tuple[bool, int]:
+    src_size = src.stat().st_size
+    if src_size <= max_bytes:
+        shutil.copy2(src, dst)
+        return False, src_size
+
+    with Image.open(src) as im:
+        if im.mode in ("RGBA", "LA"):
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            img = bg
+        else:
+            img = im.convert("RGB")
+
+    def best_quality_under_limit(candidate: Image.Image, q_low: int, q_high: int) -> Optional[bytes]:
+        # Find the highest JPEG quality that stays below the size limit.
+        ok_bytes = None
+        lo, hi = q_low, q_high
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            b = _encode_jpg_bytes(candidate, mid)
+            if len(b) <= max_bytes:
+                ok_bytes = b
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return ok_bytes
+
+    # Prefer minimal quality impact first.
+    best = best_quality_under_limit(img, 85, 96)
+    if best is None:
+        best = best_quality_under_limit(img, 70, 84)
+
+    # Only perform mild downscale if quality reduction alone cannot reach target.
+    if best is None:
+        w, h = img.size
+        for scale in [0.97, 0.94, 0.91, 0.88]:
+            nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+            resized = img.resize((nw, nh), Image.Resampling.LANCZOS)
+            best = best_quality_under_limit(resized, 75, 95)
+            if best is not None:
+                break
+
+    if best is None:
+        raise RuntimeError(f"压缩失败: {src.name}")
+    dst.write_bytes(best)
+    return True, len(best)
 
 
 def next_folder_index(parent: Path, base_name: str) -> int:
@@ -216,6 +274,10 @@ class MainWindow(QMainWindow):
         self.candidate_images: List[Path] = []
         self.current_internal_group_dir: Optional[Path] = None
         self._pending_group_dir: Optional[Path] = None
+        self.thumb_w = 176
+        self.thumb_h = 102
+        self.thumb_grid_w = 190
+        self.thumb_grid_h = 148
         self._thumb_worker_thread: Optional[QThread] = None
         self._thumb_worker: Optional[ThumbnailWorker] = None
         self._group_switch_timer = QTimer(self)
@@ -243,6 +305,7 @@ class MainWindow(QMainWindow):
 
     def _log(self, box: QTextEdit, msg: str) -> None:
         box.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+        QApplication.processEvents()
 
     def _pick_dir(self, line: QLineEdit) -> None:
         d = QFileDialog.getExistingDirectory(self, "选择目录", str(self.root))
@@ -279,10 +342,11 @@ class MainWindow(QMainWindow):
         self.internal_group_list = QListWidget()
         self.internal_group_list.currentItemChanged.connect(self.on_internal_group_changed)
         self.internal_group_list.setMinimumHeight(420)
+        self.internal_group_list.setMaximumWidth(280)
         left_col.addWidget(self.internal_group_list)
         left_wrap = QWidget()
         left_wrap.setLayout(left_col)
-        group_row.addWidget(left_wrap, 1)
+        group_row.addWidget(left_wrap, 0)
 
         mid_col = QVBoxLayout()
         mid_col.addWidget(QLabel("分组文件"))
@@ -305,7 +369,7 @@ class MainWindow(QMainWindow):
         mid_col.addWidget(self.internal_group_file_list)
         mid_wrap = QWidget()
         mid_wrap.setLayout(mid_col)
-        group_row.addWidget(mid_wrap, 2)
+        group_row.addWidget(mid_wrap, 1)
 
         layout.addLayout(group_row, 1)
 
@@ -395,7 +459,7 @@ class MainWindow(QMainWindow):
     def _start_thumbnail_worker(self, files: List[Path]) -> None:
         self._stop_thumbnail_worker()
         thread = QThread(self)
-        worker = ThumbnailWorker(files, thumb_w=200, thumb_h=120)
+        worker = ThumbnailWorker(files, thumb_w=self.thumb_w, thumb_h=self.thumb_h)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.thumbnail_ready.connect(self._on_thumbnail_ready)
@@ -429,8 +493,8 @@ class MainWindow(QMainWindow):
 
         if mode == "大图标":
             self.internal_group_file_list.setViewMode(QListView.IconMode)
-            self.internal_group_file_list.setIconSize(QSize(200, 120))
-            self.internal_group_file_list.setGridSize(QSize(220, 165))
+            self.internal_group_file_list.setIconSize(QSize(self.thumb_w, self.thumb_h))
+            self.internal_group_file_list.setGridSize(QSize(self.thumb_grid_w, self.thumb_grid_h))
             self.internal_group_file_list.setResizeMode(QListView.Adjust)
             self.internal_group_file_list.setMovement(QListView.Static)
             self.internal_group_file_list.setWordWrap(True)
@@ -483,57 +547,110 @@ class MainWindow(QMainWindow):
         imported = 0
         skipped_dup = 0
         folders_created = 0
+        compressed_count = 0
+        compress_saved_bytes = 0
 
         children = [p for p in sorted(src_root.iterdir()) if p.is_dir()]
         if not children:
             QMessageBox.warning(self, "提示", "导入目录下没有子文件夹")
             return
+        # Dedup scope = historical index + current import session.
+        # This prevents duplicates that appear multiple times in one single import run.
+        session_seen_md5 = set(self.md5_index.keys())
 
+        folder_images: List[Tuple[Path, str, List[Path]]] = []
+        total_images = 0
         for source_folder in children:
             base_name = source_folder.name.strip()
             if not base_name:
                 continue
             images = list_images(source_folder)
-            if not images:
-                self._log(self.import_log, f"{source_folder.name}: 未发现图片")
-                continue
+            folder_images.append((source_folder, base_name, images))
+            total_images += len(images)
 
-            new_items: List[Tuple[Path, str]] = []
-            for img in images:
-                h = md5_of_file(img)
-                if h in self.md5_index:
-                    skipped_dup += 1
+        progress = QProgressDialog("正在导入并去重...", "", 0, max(1, total_images), self)
+        progress.setWindowTitle("导入中")
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+        self.setEnabled(False)
+        QApplication.processEvents()
+
+        processed = 0
+        try:
+            for source_folder, base_name, images in folder_images:
+                if not images:
+                    self._log(self.import_log, f"{source_folder.name}: 未发现图片")
                     continue
-                new_items.append((img, h))
 
-            if not new_items:
-                self._log(self.import_log, f"{source_folder.name}: 全部重复，跳过")
-                continue
+                new_items: List[Tuple[Path, str]] = []
+                for img in images:
+                    processed += 1
+                    progress.setValue(processed)
+                    progress.setLabelText(f"正在检测: {img.name} ({processed}/{total_images})")
+                    QApplication.processEvents()
+                    # De-dup by original image bytes before any compression/renaming.
+                    h = md5_of_file(img)
+                    if h in session_seen_md5:
+                        skipped_dup += 1
+                        continue
+                    session_seen_md5.add(h)
+                    new_items.append((img, h))
 
-            dst_folder = self.internal_root / base_name
-            existed = dst_folder.exists()
-            ensure_dir(dst_folder)
-            if not existed:
-                folders_created += 1
+                if not new_items:
+                    self._log(self.import_log, f"{source_folder.name}: 全部重复，跳过")
+                    continue
 
-            next_idx = next_image_index_in_folder(dst_folder, base_name)
-            for src_img, h in new_items:
-                ext = src_img.suffix.lower()
-                dst_name = f"{base_name}{next_idx:03d}{ext}"
-                next_idx += 1
-                dst = dst_folder / dst_name
-                shutil.copy2(src_img, dst)
-                self.md5_index[h] = str(dst.relative_to(self.root))
-                imported += 1
+                dst_folder = self.internal_root / base_name
+                existed = dst_folder.exists()
+                ensure_dir(dst_folder)
+                if not existed:
+                    folders_created += 1
 
-            final_count = len([p for p in dst_folder.iterdir() if is_image_file(p)])
-            if final_count < 50:
-                self._log(self.import_log, f"{base_name}: 当前总数 {final_count} (<50)，建议后续补图")
-            else:
-                self._log(self.import_log, f"{base_name}: 新增 {len(new_items)} 张，当前总数 {final_count} 张")
+                next_idx = next_image_index_in_folder(dst_folder, base_name)
+                for src_img, h in new_items:
+                    raw_ext = src_img.suffix.lower()
+                    dst_name = f"{base_name}{next_idx:03d}{raw_ext}"
+                    dst = dst_folder / dst_name
+                    was_compressed, out_size = compress_image_to_under_2mb(src_img, dst, MAX_IMPORT_IMAGE_BYTES)
+                    if was_compressed:
+                        new_dst = dst.with_suffix(".jpg")
+                        if new_dst != dst:
+                            if new_dst.exists():
+                                new_dst.unlink()
+                            dst.rename(new_dst)
+                            dst = new_dst
+                        compressed_count += 1
+                        saved = max(0, src_img.stat().st_size - out_size)
+                        compress_saved_bytes += saved
+                        self._log(
+                            self.import_log,
+                            f"{src_img.name}: 压缩完成 {src_img.stat().st_size/1024:.1f}KB -> {out_size/1024:.1f}KB",
+                        )
+                    self.md5_index[h] = str(dst.relative_to(self.root))
+                    imported += 1
+                    next_idx += 1
+
+                final_count = len([p for p in dst_folder.iterdir() if is_image_file(p)])
+                if final_count < 50:
+                    self._log(self.import_log, f"{base_name}: 当前总数 {final_count} (<50)，建议后续补图")
+                else:
+                    self._log(self.import_log, f"{base_name}: 新增 {len(new_items)} 张，当前总数 {final_count} 张")
+        finally:
+            self.setEnabled(True)
+            progress.setValue(progress.maximum())
+            progress.close()
+            QApplication.processEvents()
 
         save_json(self.index_path, self.md5_index)
-        self._log(self.import_log, f"完成: 新增 {imported}，重复跳过 {skipped_dup}，新建内部库文件夹 {folders_created}")
+        self._log(
+            self.import_log,
+            f"完成: 新增 {imported}，重复跳过 {skipped_dup}，压缩 {compressed_count}，"
+            f"节省 {(compress_saved_bytes/1024/1024):.2f}MB，新建内部库文件夹 {folders_created}",
+        )
         self.refresh_internal_group_list()
 
     def _build_group_tab(self) -> None:
