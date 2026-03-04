@@ -11,9 +11,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
-from PyQt5.QtCore import QObject, QSize, Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QIcon, QImage, QPixmap
+from PyQt5.QtCore import QObject, QRect, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
+    QAbstractSpinBox,
     QAbstractItemView,
     QApplication,
     QListView,
@@ -36,11 +37,13 @@ from PyQt5.QtWidgets import (
     QInputDialog,
     QMenu,
     QDialog,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
     QComboBox,
-    QSlider,
+    QCheckBox,
     QStyle,
+    QSizePolicy,
 )
 
 
@@ -252,6 +255,176 @@ class GroupSortManagerDialog(QDialog):
         return [self.list_widget.item(i).text() for i in range(self.list_widget.count())]
 
 
+class WatermarkComboDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        painter.save()
+        rect = option.rect
+        if option.state & QStyle.State_Selected:
+            painter.fillRect(rect, option.palette.highlight())
+            text_color = option.palette.highlightedText().color()
+        else:
+            painter.fillRect(rect, option.palette.base())
+            text_color = option.palette.text().color()
+
+        icon = index.data(Qt.DecorationRole)
+        text = str(index.data(Qt.DisplayRole) or "")
+
+        icon_size = 44
+        top_margin = 4
+        icon_x = rect.x() + (rect.width() - icon_size) // 2
+        icon_y = rect.y() + top_margin
+        if isinstance(icon, QIcon) and not icon.isNull():
+            icon.paint(painter, QRect(icon_x, icon_y, icon_size, icon_size), Qt.AlignCenter)
+
+        painter.setPen(text_color)
+        text_rect = QRect(rect.x() + 4, rect.y() + top_margin + icon_size + 4, rect.width() - 8, rect.height() - icon_size - 8)
+        painter.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop, text)
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        _ = option, index
+        return QSize(92, 68)
+
+
+class OverlayPreviewLabel(QLabel):
+    borderChanged = pyqtSignal(object)
+
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(text, parent)
+        self.setMouseTracking(True)
+        self._actual_rect_norm: Optional[Tuple[float, float, float, float]] = None
+        self._current_rect_norm: Optional[Tuple[float, float, float, float]] = None
+        self._show_frames = False
+        self._manual_mode = False
+        self._drag_edge: Optional[str] = None
+
+    def set_overlay_rects(
+        self,
+        actual_rect_norm: Optional[Tuple[float, float, float, float]],
+        current_rect_norm: Optional[Tuple[float, float, float, float]],
+        show_frames: bool,
+        manual_mode: bool,
+    ) -> None:
+        self._actual_rect_norm = actual_rect_norm
+        self._current_rect_norm = current_rect_norm
+        self._show_frames = show_frames
+        self._manual_mode = manual_mode
+        self.update()
+
+    def _pix_rect(self) -> Optional[QRect]:
+        p = self.pixmap()
+        if p is None or p.isNull():
+            return None
+        x = (self.width() - p.width()) // 2
+        y = (self.height() - p.height()) // 2
+        return QRect(x, y, p.width(), p.height())
+
+    @staticmethod
+    def _norm_to_rect(norm: Tuple[float, float, float, float], base: QRect) -> QRectF:
+        x, y, w, h = norm
+        return QRectF(
+            base.x() + x * base.width(),
+            base.y() + y * base.height(),
+            max(1.0, w * base.width()),
+            max(1.0, h * base.height()),
+        )
+
+    @staticmethod
+    def _clamp_rect_norm(rect: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+        x, y, w, h = rect
+        x = max(0.0, min(1.0, x))
+        y = max(0.0, min(1.0, y))
+        w = max(0.01, min(1.0 - x, w))
+        h = max(0.01, min(1.0 - y, h))
+        return (x, y, w, h)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self._show_frames:
+            return
+        p_rect = self._pix_rect()
+        if p_rect is None:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        if self._actual_rect_norm is not None:
+            r = self._norm_to_rect(self._actual_rect_norm, p_rect)
+            painter.setPen(QPen(QColor(60, 220, 120), 2))
+            painter.drawRect(r)
+        if self._current_rect_norm is not None:
+            r = self._norm_to_rect(self._current_rect_norm, p_rect)
+            pen = QPen(QColor(255, 196, 0), 2)
+            pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(r)
+        painter.end()
+
+    def _detect_edge(self, x: float, y: float, r: QRectF) -> Optional[str]:
+        tol = 7.0
+        near_l = abs(x - r.left()) <= tol and (r.top() - tol) <= y <= (r.bottom() + tol)
+        near_r = abs(x - r.right()) <= tol and (r.top() - tol) <= y <= (r.bottom() + tol)
+        near_t = abs(y - r.top()) <= tol and (r.left() - tol) <= x <= (r.right() + tol)
+        near_b = abs(y - r.bottom()) <= tol and (r.left() - tol) <= x <= (r.right() + tol)
+        if near_l:
+            return "left"
+        if near_r:
+            return "right"
+        if near_t:
+            return "top"
+        if near_b:
+            return "bottom"
+        return None
+
+    def mousePressEvent(self, event) -> None:
+        if (
+            event.button() == Qt.LeftButton
+            and self._show_frames
+            and self._manual_mode
+            and self._current_rect_norm is not None
+        ):
+            p_rect = self._pix_rect()
+            if p_rect is not None:
+                cr = self._norm_to_rect(self._current_rect_norm, p_rect)
+                edge = self._detect_edge(event.x(), event.y(), cr)
+                if edge is not None:
+                    self._drag_edge = edge
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_edge and self._current_rect_norm is not None:
+            p_rect = self._pix_rect()
+            if p_rect is None or p_rect.width() <= 0 or p_rect.height() <= 0:
+                return
+            x, y, w, h = self._current_rect_norm
+            nx = (event.x() - p_rect.x()) / float(p_rect.width())
+            ny = (event.y() - p_rect.y()) / float(p_rect.height())
+            min_size = 0.01
+            if self._drag_edge == "left":
+                right = x + w
+                x = max(0.0, min(nx, right - min_size))
+                w = right - x
+            elif self._drag_edge == "right":
+                w = max(min_size, min(1.0 - x, nx - x))
+            elif self._drag_edge == "top":
+                bottom = y + h
+                y = max(0.0, min(ny, bottom - min_size))
+                h = bottom - y
+            elif self._drag_edge == "bottom":
+                h = max(min_size, min(1.0 - y, ny - y))
+            self._current_rect_norm = self._clamp_rect_norm((x, y, w, h))
+            self.borderChanged.emit(self._current_rect_norm)
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_edge = None
+        super().mouseReleaseEvent(event)
+
+
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -441,6 +614,28 @@ class MainWindow(QMainWindow):
         self._group_switch_timer = QTimer(self)
         self._group_switch_timer.setSingleShot(True)
         self._group_switch_timer.timeout.connect(self._apply_pending_group_change)
+        self._preview_debounce_timer = QTimer(self)
+        self._preview_debounce_timer.setSingleShot(True)
+        self._preview_debounce_timer.timeout.connect(self.update_preview)
+        self._preview_interval_normal_ms = 16
+        self._preview_interval_drag_ms = 33
+        self._preview_rendering = False
+        self._preview_dirty = False
+        self._sample_preview_cache_key: Optional[Tuple[str, float, int, int]] = None
+        self._sample_preview_cache_img: Optional[Image.Image] = None
+        self._wm_raw_cache_key: Optional[Tuple[str, float]] = None
+        self._wm_raw_cache_img: Optional[Image.Image] = None
+        self._wm_sim_cache_key: Optional[Tuple[object, ...]] = None
+        self._wm_sim_cache_img: Optional[Image.Image] = None
+        self._wm_preview_pix_cache_key: Optional[Tuple[object, ...]] = None
+        self._wm_preview_pix_cache_img: Optional[QPixmap] = None
+        self._preview_sliders: List[QSpinBox] = []
+        self._wm_actual_border_norm: Optional[Tuple[float, float, float, float]] = None
+        self._wm_current_border_norm: Optional[Tuple[float, float, float, float]] = None
+        self._fx_actual_border_norm: Optional[Tuple[float, float, float, float]] = None
+        self._fx_current_border_norm: Optional[Tuple[float, float, float, float]] = None
+        self._wm_border_user_modified = False
+        self._fx_border_user_modified = False
         self._preview_windows: List[ImagePreviewDialog] = []
 
         self.tabs = QTabWidget()
@@ -455,12 +650,22 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.wm_tab, "2) 水印库与配置")
         self.tabs.addTab(self.group_tab, "3) 商品图分组")
         self.tabs.addTab(self.export_tab, "4) 批量出图")
+        self.tabs.currentChanged.connect(self.on_tab_changed)
 
         self._build_import_tab()
         self._build_group_tab()
         self._build_wm_tab()
         self._build_export_tab()
         self.refresh_watermark_lists()
+        # Force initial preview render: show base image even without watermark.
+        self.update_preview()
+
+    def on_tab_changed(self, idx: int) -> None:
+        # Refresh preview whenever switching to the watermark tab.
+        if self.tabs.widget(idx) is self.wm_tab:
+            self.update_preview()
+        else:
+            self._preview_debounce_timer.stop()
 
     def _log(self, box: QTextEdit, msg: str) -> None:
         box.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -1235,6 +1440,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._group_switch_timer.stop()
+        self._preview_debounce_timer.stop()
         self._stop_thumbnail_worker()
         super().closeEvent(event)
 
@@ -1479,64 +1685,149 @@ class MainWindow(QMainWindow):
         self.refresh_export_folder_list()
 
     def _build_wm_tab(self) -> None:
-        layout = QVBoxLayout(self.wm_tab)
+        layout = QHBoxLayout(self.wm_tab)
+        self.default_preview_image = self.root / "默认预览底图.jpg"
+
+        left_col = QVBoxLayout()
+        right_col = QVBoxLayout()
+        left_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setContentsMargins(0, 0, 0, 0)
+        left_col.setSpacing(8)
+        right_col.setSpacing(8)
 
         top_box = QGroupBox("水印库")
+        top_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        top_box.setFixedHeight(96)
         top_layout = QFormLayout(top_box)
         wm_row = QHBoxLayout()
         self._normalize_row_spacing(wm_row)
         self.watermark_file_line = QLineEdit()
         pick_wm = QPushButton("选择PNG")
         pick_wm.clicked.connect(lambda: self._pick_file(self.watermark_file_line, "PNG Files (*.png)"))
-        add_wm = QPushButton("加入水印库")
-        add_wm.clicked.connect(self.add_watermark_file)
         wm_row.addWidget(self.watermark_file_line)
         wm_row.addWidget(pick_wm)
-        wm_row.addWidget(add_wm)
-        w = QWidget()
-        w.setLayout(wm_row)
-        top_layout.addRow("PNG水印", w)
+        w_row1 = QWidget()
+        w_row1.setLayout(wm_row)
+        top_layout.addRow("PNG水印", w_row1)
+
+        name_row = QHBoxLayout()
+        self._normalize_row_spacing(name_row)
+        self.watermark_name_line = QLineEdit()
+        self.watermark_name_line.setPlaceholderText("可选：自定义水印名称")
+        add_wm = QPushButton("加入水印库")
+        add_wm.clicked.connect(self.add_watermark_file)
+        name_row.addWidget(self.watermark_name_line)
+        name_row.addWidget(add_wm)
+        w_row2 = QWidget()
+        w_row2.setLayout(name_row)
+        top_layout.addRow("水印命名", w_row2)
+        left_col.addWidget(top_box)
+
+        setting_box = QGroupBox("水印设置")
+        setting_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        setting_box.setFixedHeight(275)
+        setting_layout = QGridLayout(setting_box)
 
         self.wm_selector = QComboBox()
-        self.wm_selector.currentIndexChanged.connect(self.update_preview)
-        top_layout.addRow("已入库水印", self.wm_selector)
-        layout.addWidget(top_box)
+        self.wm_selector.setIconSize(QSize(44, 44))
+        wm_view = QListView()
+        wm_view.setIconSize(QSize(44, 44))
+        wm_view.setSpacing(4)
+        self.wm_selector.setView(wm_view)
+        self.wm_selector.setItemDelegate(WatermarkComboDelegate(self.wm_selector))
+        self.wm_selector.currentIndexChanged.connect(self._on_wm_selector_changed)
+
+        self.wm_x_slider = self._make_slider(0, 100, 50, self.update_preview)
+        self.wm_y_slider = self._make_slider(0, 100, 50, self.update_preview)
+        self.wm_scale_slider = self._make_slider(10, 200, 100, self.update_preview)
+        self.wm_rotate_slider = self._make_slider(-180, 180, 0, self.update_preview)
+        self.wm_opacity_slider = self._make_slider(1, 100, 100, self.update_preview)
+        self.show_border_checkbox = QCheckBox("显示图框")
+        self.show_border_checkbox.setChecked(False)
+        self.show_border_checkbox.toggled.connect(self.update_preview)
+        self.manual_border_checkbox = QCheckBox("手动调整边框")
+        self.manual_border_checkbox.setChecked(False)
+        self.manual_border_checkbox.toggled.connect(self._on_manual_border_toggled)
+
+        setting_layout.addWidget(QLabel("选择水印"), 0, 0)
+        setting_layout.addWidget(self.wm_selector, 0, 1, 1, 3)
+        setting_layout.addWidget(self.show_border_checkbox, 1, 1)
+        setting_layout.addWidget(self.manual_border_checkbox, 1, 2, 1, 2)
+        setting_layout.addWidget(QLabel("左右移动(X%)"), 2, 0)
+        setting_layout.addWidget(self.wm_x_slider, 2, 1, 1, 3)
+        setting_layout.addWidget(QLabel("上下移动(Y%)"), 3, 0)
+        setting_layout.addWidget(self.wm_y_slider, 3, 1, 1, 3)
+        setting_layout.addWidget(QLabel("缩放(%)"), 4, 0)
+        setting_layout.addWidget(self.wm_scale_slider, 4, 1, 1, 3)
+        setting_layout.addWidget(QLabel("旋转(°)"), 5, 0)
+        setting_layout.addWidget(self.wm_rotate_slider, 5, 1, 1, 3)
+        setting_layout.addWidget(QLabel("透明度(%)"), 6, 0)
+        setting_layout.addWidget(self.wm_opacity_slider, 6, 1, 1, 3)
+
+        btn_apply = QPushButton("应用")
+        btn_apply.clicked.connect(self.apply_wm_settings)
+        btn_reset = QPushButton("重置")
+        btn_reset.clicked.connect(self.reset_wm_settings)
+        btn_delete = QPushButton("删除")
+        btn_delete.clicked.connect(self.delete_selected_watermark)
+        setting_layout.addWidget(btn_apply, 7, 1)
+        setting_layout.addWidget(btn_reset, 7, 2)
+        setting_layout.addWidget(btn_delete, 7, 3)
+        left_col.addWidget(setting_box)
 
         cfg_box = QGroupBox("配置参数")
+        cfg_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        cfg_box.setFixedHeight(205)
         cfg_layout = QGridLayout(cfg_box)
 
-        self.cfg_name = QLineEdit("默认配置")
-        self.x_slider = self._make_slider(0, 100, 50, self.update_preview)
-        self.y_slider = self._make_slider(0, 100, 50, self.update_preview)
-        self.scale_slider = self._make_slider(5, 100, 25, self.update_preview)
-        self.rotate_slider = self._make_slider(-180, 180, 0, self.update_preview)
-        self.opacity_slider = self._make_slider(1, 100, 100, self.update_preview)
+        self.cfg_name = QLineEdit("")
+        self.final_x_slider = self._make_slider(0, 100, 50, self.update_preview)
+        self.final_y_slider = self._make_slider(0, 100, 50, self.update_preview)
+        self.final_scale_slider = self._make_slider(5, 100, 25, self.update_preview)
+        self.final_rotate_slider = self._make_slider(-180, 180, 0, self.update_preview)
+        self.final_opacity_slider = self._make_slider(1, 100, 100, self.update_preview)
+        self._preview_sliders = [
+            self.wm_x_slider,
+            self.wm_y_slider,
+            self.wm_scale_slider,
+            self.wm_rotate_slider,
+            self.wm_opacity_slider,
+            self.final_x_slider,
+            self.final_y_slider,
+            self.final_scale_slider,
+            self.final_rotate_slider,
+            self.final_opacity_slider,
+        ]
+        for s in self._preview_sliders:
+            s.editingFinished.connect(self.request_preview_update)
 
         cfg_layout.addWidget(QLabel("配置名"), 0, 0)
         cfg_layout.addWidget(self.cfg_name, 0, 1, 1, 3)
         cfg_layout.addWidget(QLabel("X(%)"), 1, 0)
-        cfg_layout.addWidget(self.x_slider, 1, 1, 1, 3)
+        cfg_layout.addWidget(self.final_x_slider, 1, 1, 1, 3)
         cfg_layout.addWidget(QLabel("Y(%)"), 2, 0)
-        cfg_layout.addWidget(self.y_slider, 2, 1, 1, 3)
+        cfg_layout.addWidget(self.final_y_slider, 2, 1, 1, 3)
         cfg_layout.addWidget(QLabel("缩放(占图宽%)"), 3, 0)
-        cfg_layout.addWidget(self.scale_slider, 3, 1, 1, 3)
+        cfg_layout.addWidget(self.final_scale_slider, 3, 1, 1, 3)
         cfg_layout.addWidget(QLabel("旋转(°)"), 4, 0)
-        cfg_layout.addWidget(self.rotate_slider, 4, 1, 1, 3)
+        cfg_layout.addWidget(self.final_rotate_slider, 4, 1, 1, 3)
         cfg_layout.addWidget(QLabel("透明度(%)"), 5, 0)
-        cfg_layout.addWidget(self.opacity_slider, 5, 1, 1, 3)
+        cfg_layout.addWidget(self.final_opacity_slider, 5, 1, 1, 3)
 
-        layout.addWidget(cfg_box)
+        left_col.addWidget(cfg_box)
 
         sample_row = QHBoxLayout()
         self._normalize_row_spacing(sample_row)
-        self.sample_image_line = QLineEdit()
+        self.sample_image_line = QLineEdit(str(self.default_preview_image))
         pick_sample = QPushButton("选择预览底图")
         pick_sample.clicked.connect(lambda: self._pick_file(self.sample_image_line, "Image Files (*.png *.jpg *.jpeg *.webp *.bmp)"))
         sample_row.addWidget(self.sample_image_line)
         sample_row.addWidget(pick_sample)
         sample_w = QWidget()
         sample_w.setLayout(sample_row)
-        layout.addWidget(sample_w)
+        sample_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        sample_w.setFixedHeight(34)
+        left_col.addWidget(sample_w)
 
         btn_row = QHBoxLayout()
         self._normalize_row_spacing(btn_row)
@@ -1547,44 +1838,411 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(QLabel("配置存档"))
         btn_row.addWidget(self.config_selector)
         btn_row.addWidget(save_btn)
-        layout.addLayout(btn_row)
+        btn_w = QWidget()
+        btn_w.setLayout(btn_row)
+        btn_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        btn_w.setFixedHeight(34)
+        left_col.addWidget(btn_w)
 
-        self.preview_label = QLabel("预览区")
+        self.preview_label = OverlayPreviewLabel("预览区")
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(320)
+        self.preview_label.setMinimumHeight(560)
         self.preview_label.setStyleSheet("border: 1px solid #999;")
-        layout.addWidget(self.preview_label)
+        wm_show_box = QGroupBox("水印预览")
+        wm_show_layout = QVBoxLayout(wm_show_box)
+        self.current_wm_preview = OverlayPreviewLabel("无")
+        self.current_wm_preview.setAlignment(Qt.AlignCenter)
+        self.current_wm_preview.setMinimumHeight(120)
+        self.current_wm_preview.setMaximumHeight(120)
+        self.current_wm_preview.setStyleSheet("border: 1px solid #999;")
+        self.current_wm_preview.borderChanged.connect(self._on_wm_border_changed)
+        self.preview_label.borderChanged.connect(self._on_fx_border_changed)
+        self.current_wm_name = QLabel("未选择水印")
+        self.current_wm_name.setAlignment(Qt.AlignCenter)
+        self.current_wm_name.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.current_wm_name.setFixedHeight(22)
+        wm_show_layout.addWidget(self.current_wm_preview)
+        wm_show_layout.addWidget(self.current_wm_name)
+        wm_show_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        wm_show_box.setFixedHeight(176)
+        right_col.addWidget(wm_show_box, 0)
+
+        effect_box = QGroupBox("效果预览")
+        effect_layout = QVBoxLayout(effect_box)
+        effect_layout.setContentsMargins(6, 12, 6, 6)
+        effect_layout.addWidget(self.preview_label, 1)
+        right_col.addWidget(effect_box, 1)
 
         self.wm_log = QTextEdit()
         self.wm_log.setReadOnly(True)
-        layout.addWidget(self.wm_log)
+        self.wm_log.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        left_col.addWidget(self.wm_log, 1)
 
-    def _make_slider(self, min_v: int, max_v: int, default: int, callback) -> QSlider:
-        s = QSlider(Qt.Horizontal)
+        layout.addLayout(left_col, 2)
+        layout.addLayout(right_col, 3)
+        self.update_preview()
+
+    def _make_slider(self, min_v: int, max_v: int, default: int, callback) -> QSpinBox:
+        s = QSpinBox()
         s.setRange(min_v, max_v)
         s.setValue(default)
-        s.valueChanged.connect(callback)
+        s.setSingleStep(1)
+        s.setAccelerated(True)
+        s.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
+        s.setAlignment(Qt.AlignCenter)
+        if callback == self.update_preview:
+            # Real-time update with coalescing: every change requests a render tick.
+            s.valueChanged.connect(self.request_preview_update)
+        else:
+            s.valueChanged.connect(callback)
         return s
+
+    def request_preview_update(self) -> None:
+        self._preview_dirty = True
+        if self._preview_rendering:
+            return
+        self._preview_debounce_timer.start(self._preview_interval_for_state())
+
+    def _is_preview_slider_active(self) -> bool:
+        # SpinBox has no drag state; keep preview in normal realtime mode.
+        return False
+
+    def _preview_interval_for_state(self) -> int:
+        return self._preview_interval_drag_ms if self._is_preview_slider_active() else self._preview_interval_normal_ms
 
     def add_watermark_file(self) -> None:
         src = Path(self.watermark_file_line.text().strip())
         if not src.exists() or src.suffix.lower() != ".png":
             QMessageBox.warning(self, "错误", "请选择有效的PNG水印文件")
             return
-        dst = self.watermark_root / src.name
+        custom_name = self.watermark_name_line.text().strip()
+        if custom_name:
+            invalid = set('<>:"/\\|?*')
+            if any(ch in invalid for ch in custom_name):
+                QMessageBox.warning(self, "错误", "水印名称包含非法字符")
+                return
+            dst_name = f"{custom_name}.png"
+        else:
+            dst_name = src.name
+        dst = self.watermark_root / dst_name
+        if dst.exists():
+            stem = dst.stem
+            for i in range(2, 10000):
+                candidate = self.watermark_root / f"{stem}_{i}.png"
+                if not candidate.exists():
+                    dst = candidate
+                    break
         shutil.copy2(src, dst)
         self._log(self.wm_log, f"已入库水印: {dst.name}")
+        self.watermark_name_line.clear()
         self.refresh_watermark_lists()
 
+    def apply_wm_settings(self) -> None:
+        wm_file = self._selected_wm_filename()
+        if not wm_file:
+            QMessageBox.information(self, "提示", "请先选择水印")
+            return
+        wm_path = self.watermark_root / wm_file
+        if not wm_path.exists():
+            QMessageBox.warning(self, "错误", "水印文件不存在")
+            return
+        try:
+            with Image.open(wm_path) as wm_raw:
+                wm_processed = self._apply_watermark_image_settings(wm_raw)
+            wm_processed.save(wm_path, format="PNG")
+            self._wm_raw_cache_key = None
+            self._wm_raw_cache_img = None
+            self._wm_sim_cache_key = None
+            self._wm_sim_cache_img = None
+            self._wm_preview_pix_cache_key = None
+            self._wm_preview_pix_cache_img = None
+            self._wm_border_user_modified = False
+            self._fx_border_user_modified = False
+            self._wm_current_border_norm = None
+            self._fx_current_border_norm = None
+            # Once applied to file, reset sliders so "current status" equals saved watermark.
+            self._reset_wm_setting_sliders()
+            self.refresh_watermark_lists()
+            self.update_preview()
+            self._log(self.wm_log, f"已应用并覆盖水印: {wm_path.name}")
+        except Exception as e:
+            QMessageBox.critical(self, "应用失败", f"{type(e).__name__}: {e}")
+
+    def reset_wm_settings(self) -> None:
+        # Reset unsaved edits back to the last applied state (current file on disk).
+        self._reset_wm_setting_sliders()
+        self._wm_border_user_modified = False
+        self._fx_border_user_modified = False
+        self._wm_current_border_norm = None
+        self._fx_current_border_norm = None
+        self.update_preview()
+        self._log(self.wm_log, "已重置到该水印最后一次应用状态")
+
+    def _reset_wm_setting_sliders(self) -> None:
+        self.wm_x_slider.setValue(50)
+        self.wm_y_slider.setValue(50)
+        self.wm_scale_slider.setValue(100)
+        self.wm_rotate_slider.setValue(0)
+        self.wm_opacity_slider.setValue(100)
+
+    def delete_selected_watermark(self) -> None:
+        wm_file = self._selected_wm_filename()
+        if not wm_file:
+            QMessageBox.information(self, "提示", "请先选择水印")
+            return
+        wm_path = self.watermark_root / wm_file
+        if not wm_path.exists():
+            QMessageBox.warning(self, "错误", "水印文件不存在")
+            return
+        ans = QMessageBox.question(
+            self,
+            "删除水印",
+            f"确认删除水印“{wm_path.stem}”吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            wm_path.unlink()
+            self._wm_raw_cache_key = None
+            self._wm_raw_cache_img = None
+            self._wm_sim_cache_key = None
+            self._wm_sim_cache_img = None
+            self._wm_preview_pix_cache_key = None
+            self._wm_preview_pix_cache_img = None
+            self._log(self.wm_log, f"已删除水印: {wm_path.name}")
+            self.refresh_watermark_lists()
+            self.refresh_export_config_list()
+            self.update_preview()
+        except Exception as e:
+            QMessageBox.critical(self, "删除失败", f"{type(e).__name__}: {e}")
+
+    def _selected_wm_filename(self) -> str:
+        data = self.wm_selector.currentData()
+        if isinstance(data, str) and data:
+            return data
+        return self.wm_selector.currentText().strip()
+
+    def _make_wm_selector_icon(self, p: Path, size: int = 44) -> QIcon:
+        pix = QPixmap(str(p))
+        if pix.isNull():
+            return QIcon()
+        pix = pix.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        return QIcon(pix)
+
+    def _render_checkerboard_preview(self, src_pix: QPixmap, target_w: int, target_h: int) -> QPixmap:
+        # Render PNG alpha on checkerboard background for transparent-channel visibility.
+        w = max(1, target_w)
+        h = max(1, target_h)
+        canvas = QPixmap(w, h)
+        canvas.fill(QColor(0, 0, 0, 0))
+        p = QPainter(canvas)
+        c1 = QColor(238, 238, 238)
+        c2 = QColor(212, 212, 212)
+        block = 10
+        for y in range(0, h, block):
+            for x in range(0, w, block):
+                p.fillRect(x, y, block, block, c1 if ((x // block + y // block) % 2 == 0) else c2)
+        if not src_pix.isNull():
+            draw = src_pix.scaled(w - 8, h - 8, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            dx = (w - draw.width()) // 2
+            dy = (h - draw.height()) // 2
+            p.drawPixmap(dx, dy, draw)
+        p.end()
+        return canvas
+
+    def _get_cached_sample_preview(self, sample_path: Path, tw: int, th: int) -> Image.Image:
+        st = sample_path.stat()
+        key = (str(sample_path), st.st_mtime, tw, th)
+        if self._sample_preview_cache_key == key and self._sample_preview_cache_img is not None:
+            return self._sample_preview_cache_img.copy()
+
+        with Image.open(sample_path) as img:
+            src = img.convert("RGB")
+            fitted = ImageOps.contain(src, (tw, th), method=Image.Resampling.LANCZOS)
+            canvas = Image.new("RGB", (tw, th), (32, 32, 32))
+            x = (tw - fitted.width) // 2
+            y = (th - fitted.height) // 2
+            canvas.paste(fitted, (x, y))
+        self._sample_preview_cache_key = key
+        self._sample_preview_cache_img = canvas
+        return canvas.copy()
+
+    def _get_cached_wm_raw(self, wm_path: Path) -> Image.Image:
+        st = wm_path.stat()
+        key = (str(wm_path), st.st_mtime)
+        if self._wm_raw_cache_key == key and self._wm_raw_cache_img is not None:
+            return self._wm_raw_cache_img.copy()
+        with Image.open(wm_path) as wm:
+            raw = wm.convert("RGBA")
+        self._wm_raw_cache_key = key
+        self._wm_raw_cache_img = raw
+        return raw.copy()
+
+    def _apply_watermark_image_settings(self, wm_img: Image.Image, fast_mode: bool = False) -> Image.Image:
+        # Watermark settings: process the watermark image itself.
+        mark = wm_img.convert("RGBA")
+        resize_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.LANCZOS
+        rotate_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.BICUBIC
+        scale_pct = max(1, self.wm_scale_slider.value())
+        nw = max(2, int(mark.width * scale_pct / 100))
+        nh = max(2, int(mark.height * scale_pct / 100))
+        mark = mark.resize((nw, nh), resize_resample)
+        mark = mark.rotate(self.wm_rotate_slider.value(), expand=True, resample=rotate_resample)
+
+        op = self.wm_opacity_slider.value()
+        if op < 100:
+            alpha = mark.getchannel("A").point(lambda x: int(x * op / 100))
+            mark.putalpha(alpha)
+
+        # Apply X/Y movement on watermark image canvas.
+        dx = int((self.wm_x_slider.value() - 50) / 50.0 * mark.width * 0.5)
+        dy = int((self.wm_y_slider.value() - 50) / 50.0 * mark.height * 0.5)
+        if dx != 0 or dy != 0:
+            cw = mark.width + abs(dx)
+            ch = mark.height + abs(dy)
+            canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+            px = max(dx, 0)
+            py = max(dy, 0)
+            canvas.paste(mark, (px, py), mark)
+            mark = canvas
+        return mark
+
+    def _compose_effect_preview(
+        self, base_img: Image.Image, wm_layer: Image.Image, fast_mode: bool = False
+    ) -> Tuple[Image.Image, Tuple[float, float, float, float]]:
+        # Preview-only composition: simulate two layers (base + watermark), no file write.
+        base = base_img.convert("RGBA")
+        mark = wm_layer.convert("RGBA")
+        resize_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.LANCZOS
+        rotate_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.BICUBIC
+
+        target_w = max(8, int(base.width * self.final_scale_slider.value() / 100))
+        ratio = target_w / max(1, mark.width)
+        target_h = max(8, int(mark.height * ratio))
+        mark = mark.resize((target_w, target_h), resize_resample)
+        mark = mark.rotate(self.final_rotate_slider.value(), expand=True, resample=rotate_resample)
+
+        op = self.final_opacity_slider.value()
+        if op < 100:
+            alpha = mark.getchannel("A").point(lambda x: int(x * op / 100))
+            mark.putalpha(alpha)
+
+        cx = int(base.width * self.final_x_slider.value() / 100)
+        cy = int(base.height * self.final_y_slider.value() / 100)
+        x = cx - mark.width // 2
+        y = cy - mark.height // 2
+
+        wm_overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        wm_overlay.paste(mark, (x, y), mark)
+        out = Image.alpha_composite(base, wm_overlay)
+        bbox = mark.getchannel("A").getbbox()
+        if bbox:
+            l, t, r, b = bbox
+            ax = x + l
+            ay = y + t
+            aw = max(1, r - l)
+            ah = max(1, b - t)
+        else:
+            ax, ay, aw, ah = x, y, mark.width, mark.height
+        bx = ax / float(max(1, base.width))
+        by = ay / float(max(1, base.height))
+        bw = aw / float(max(1, base.width))
+        bh = ah / float(max(1, base.height))
+        return out, self._clamp_norm_rect((bx, by, bw, bh))
+
+    def _get_cached_simulated_wm(self, wm_path: Path, fast_mode: bool) -> Image.Image:
+        st = wm_path.stat()
+        key = (
+            str(wm_path),
+            st.st_mtime,
+            self.wm_x_slider.value(),
+            self.wm_y_slider.value(),
+            self.wm_scale_slider.value(),
+            self.wm_rotate_slider.value(),
+            self.wm_opacity_slider.value(),
+            fast_mode,
+        )
+        if self._wm_sim_cache_key == key and self._wm_sim_cache_img is not None:
+            return self._wm_sim_cache_img.copy()
+        wm_raw = self._get_cached_wm_raw(wm_path)
+        wm_processed = self._apply_watermark_image_settings(wm_raw, fast_mode=fast_mode)
+        self._wm_sim_cache_key = key
+        self._wm_sim_cache_img = wm_processed
+        return wm_processed.copy()
+
+    def _get_cached_wm_preview_pix(self, wm_processed: Image.Image, target_w: int, target_h: int) -> QPixmap:
+        key = (self._wm_sim_cache_key, target_w, target_h)
+        if self._wm_preview_pix_cache_key == key and self._wm_preview_pix_cache_img is not None:
+            return QPixmap(self._wm_preview_pix_cache_img)
+        wm_thumb = pil_to_qpixmap(wm_processed)
+        if wm_thumb.isNull():
+            return QPixmap()
+        wm_thumb = self._render_checkerboard_preview(wm_thumb, target_w, target_h)
+        self._wm_preview_pix_cache_key = key
+        self._wm_preview_pix_cache_img = QPixmap(wm_thumb)
+        return wm_thumb
+
+    @staticmethod
+    def _clamp_norm_rect(rect: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+        x, y, w, h = rect
+        x = max(0.0, min(1.0, x))
+        y = max(0.0, min(1.0, y))
+        w = max(0.01, min(1.0 - x, w))
+        h = max(0.01, min(1.0 - y, h))
+        return (x, y, w, h)
+
+    def _alpha_bbox_norm(self, img: Image.Image) -> Tuple[float, float, float, float]:
+        rgba = img.convert("RGBA")
+        bbox = rgba.getchannel("A").getbbox()
+        if not bbox:
+            return (0.0, 0.0, 1.0, 1.0)
+        l, t, r, b = bbox
+        w = max(1, rgba.width)
+        h = max(1, rgba.height)
+        return self._clamp_norm_rect((l / w, t / h, (r - l) / w, (b - t) / h))
+
+    def _on_wm_border_changed(self, rect_norm) -> None:
+        if not self.manual_border_checkbox.isChecked():
+            return
+        if isinstance(rect_norm, tuple) and len(rect_norm) == 4:
+            self._wm_current_border_norm = self._clamp_norm_rect(rect_norm)
+            self._wm_border_user_modified = True
+
+    def _on_fx_border_changed(self, rect_norm) -> None:
+        if not self.manual_border_checkbox.isChecked():
+            return
+        if isinstance(rect_norm, tuple) and len(rect_norm) == 4:
+            self._fx_current_border_norm = self._clamp_norm_rect(rect_norm)
+            self._fx_border_user_modified = True
+
+    def _on_manual_border_toggled(self, _checked: bool) -> None:
+        # Re-initialize current frame from actual frame when mode changes.
+        self._wm_border_user_modified = False
+        self._fx_border_user_modified = False
+        self._wm_current_border_norm = None
+        self._fx_current_border_norm = None
+        self.update_preview()
+
+    def _on_wm_selector_changed(self, _idx: int) -> None:
+        # New watermark should start with current frame aligned to actual frame.
+        self._wm_border_user_modified = False
+        self._fx_border_user_modified = False
+        self._wm_current_border_norm = None
+        self._fx_current_border_norm = None
+        self.update_preview()
+
     def refresh_watermark_lists(self) -> None:
-        current_wm = self.wm_selector.currentText()
+        current_wm = self._selected_wm_filename()
         self.wm_selector.clear()
         for p in sorted(self.watermark_root.glob("*.png")):
-            self.wm_selector.addItem(p.name)
+            self.wm_selector.addItem(self._make_wm_selector_icon(p), p.stem, p.name)
         if current_wm:
-            idx = self.wm_selector.findText(current_wm)
-            if idx >= 0:
-                self.wm_selector.setCurrentIndex(idx)
+            for i in range(self.wm_selector.count()):
+                if self.wm_selector.itemData(i) == current_wm:
+                    self.wm_selector.setCurrentIndex(i)
+                    break
 
         current_cfg = self.config_selector.currentText() if hasattr(self, "config_selector") else ""
         if hasattr(self, "config_selector"):
@@ -1597,18 +2255,18 @@ class MainWindow(QMainWindow):
                     self.config_selector.setCurrentIndex(idx)
 
     def current_cfg_obj(self) -> Optional[WatermarkConfig]:
-        wm_name = self.wm_selector.currentText().strip()
+        wm_name = self._selected_wm_filename()
         cfg_name = self.cfg_name.text().strip()
         if not wm_name or not cfg_name:
             return None
         return WatermarkConfig(
             name=cfg_name,
             watermark_file=wm_name,
-            x_pct=self.x_slider.value(),
-            y_pct=self.y_slider.value(),
-            scale_pct=self.scale_slider.value(),
-            rotate_deg=self.rotate_slider.value(),
-            opacity_pct=self.opacity_slider.value(),
+            x_pct=self.final_x_slider.value(),
+            y_pct=self.final_y_slider.value(),
+            scale_pct=self.final_scale_slider.value(),
+            rotate_deg=self.final_rotate_slider.value(),
+            opacity_pct=self.final_opacity_slider.value(),
         )
 
     def save_current_config(self) -> None:
@@ -1630,42 +2288,112 @@ class MainWindow(QMainWindow):
             return
         self.cfg_name.setText(data.get("name", name))
         wm_file = data.get("watermark_file", "")
-        idx = self.wm_selector.findText(wm_file)
-        if idx >= 0:
-            self.wm_selector.setCurrentIndex(idx)
-        self.x_slider.setValue(int(data.get("x_pct", 50)))
-        self.y_slider.setValue(int(data.get("y_pct", 50)))
-        self.scale_slider.setValue(int(data.get("scale_pct", 25)))
-        self.rotate_slider.setValue(int(data.get("rotate_deg", 0)))
-        self.opacity_slider.setValue(int(data.get("opacity_pct", 100)))
+        for i in range(self.wm_selector.count()):
+            if self.wm_selector.itemData(i) == wm_file:
+                self.wm_selector.setCurrentIndex(i)
+                break
+        self.final_x_slider.setValue(int(data.get("x_pct", 50)))
+        self.final_y_slider.setValue(int(data.get("y_pct", 50)))
+        self.final_scale_slider.setValue(int(data.get("scale_pct", 25)))
+        self.final_rotate_slider.setValue(int(data.get("rotate_deg", 0)))
+        self.final_opacity_slider.setValue(int(data.get("opacity_pct", 100)))
         self.update_preview()
 
     def update_preview(self) -> None:
-        cfg = self.current_cfg_obj()
-        if not cfg:
-            self.preview_label.setText("预览区")
+        if self._preview_rendering:
+            self._preview_dirty = True
             return
-        wm_path = self.watermark_root / cfg.watermark_file
-        if not wm_path.exists():
-            self.preview_label.setText("未找到水印文件")
-            return
-
-        sample_path = Path(self.sample_image_line.text().strip()) if self.sample_image_line.text().strip() else None
-        if not sample_path or not sample_path.exists():
+        self._preview_debounce_timer.stop()
+        self._preview_rendering = True
+        self._preview_dirty = False
+        fast_mode = self._is_preview_slider_active()
+        sample_path = Path(self.sample_image_line.text().strip()) if self.sample_image_line.text().strip() else self.default_preview_image
+        if not sample_path.exists() and self.default_preview_image.exists():
+            sample_path = self.default_preview_image
+            self.sample_image_line.setText(str(sample_path))
+        if not sample_path.exists():
             internal_imgs = list_images(self.second_root)
             sample_path = internal_imgs[0] if internal_imgs else None
             if sample_path is None:
-                self.preview_label.setText("请先选择预览底图")
+                self.preview_label.setText("未找到默认预览底图.jpg，请手动选择预览底图")
+                self._preview_rendering = False
                 return
 
         try:
-            with Image.open(sample_path) as img, Image.open(wm_path) as wm:
-                composed = apply_watermark(img, wm, cfg)
-                pix = pil_to_qpixmap(composed)
-                pix = pix.scaled(self.preview_label.width() - 8, self.preview_label.height() - 8, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.preview_label.setPixmap(pix)
+            tw = max(1, self.preview_label.width() - 8)
+            th = max(1, self.preview_label.height() - 8)
+            base_preview = self._get_cached_sample_preview(sample_path, tw, th)
+            effect_preview = base_preview.convert("RGBA")
+            show_frames = self.show_border_checkbox.isChecked()
+            manual_mode = self.manual_border_checkbox.isChecked()
+            self._wm_actual_border_norm = None
+            self._fx_actual_border_norm = None
+
+            # Show base image first even if watermark is not selected yet.
+            wm_name = self._selected_wm_filename()
+            wm_path = self.watermark_root / wm_name if wm_name else None
+            if wm_path is not None and wm_path.exists():
+                wm_processed = self._get_cached_simulated_wm(wm_path, fast_mode=fast_mode)
+                self._wm_actual_border_norm = self._alpha_bbox_norm(wm_processed)
+                if (not manual_mode) or (not self._wm_border_user_modified) or (self._wm_current_border_norm is None):
+                    self._wm_current_border_norm = self._wm_actual_border_norm
+                wm_thumb = self._get_cached_wm_preview_pix(
+                    wm_processed,
+                    max(1, self.current_wm_preview.width() - 2),
+                    max(1, self.current_wm_preview.height() - 2),
+                )
+                if not wm_thumb.isNull():
+                    self.current_wm_preview.setPixmap(wm_thumb)
+                    self.current_wm_preview.setText("")
+                else:
+                    self.current_wm_preview.setPixmap(QPixmap())
+                    self.current_wm_preview.setText("水印预览失败")
+                self.current_wm_name.setText(wm_path.stem)
+                # Two-layer simulation for effect preview; no persistent image data change.
+                effect_preview, self._fx_actual_border_norm = self._compose_effect_preview(
+                    base_preview,
+                    wm_processed,
+                    fast_mode=fast_mode,
+                )
+                if (not manual_mode) or (not self._fx_border_user_modified) or (self._fx_current_border_norm is None):
+                    self._fx_current_border_norm = self._fx_actual_border_norm
+            else:
+                empty = self._render_checkerboard_preview(QPixmap(), max(1, self.current_wm_preview.width() - 2), max(1, self.current_wm_preview.height() - 2))
+                self.current_wm_preview.setPixmap(empty)
+                self.current_wm_preview.setText("无")
+                self.current_wm_name.setText("未选择水印")
+                self._wm_current_border_norm = None
+                self._fx_current_border_norm = None
+                self._wm_border_user_modified = False
+                self._fx_border_user_modified = False
+
+            pix = pil_to_qpixmap(effect_preview)
+            # Always fit the whole image into preview area without crop.
+            pix = pix.scaled(
+                max(1, self.preview_label.width() - 8),
+                max(1, self.preview_label.height() - 8),
+                Qt.KeepAspectRatio,
+                Qt.FastTransformation if fast_mode else Qt.SmoothTransformation,
+            )
+            self.preview_label.setPixmap(pix)
+            self.current_wm_preview.set_overlay_rects(
+                self._wm_actual_border_norm,
+                self._wm_current_border_norm,
+                show_frames,
+                manual_mode,
+            )
+            self.preview_label.set_overlay_rects(
+                self._fx_actual_border_norm,
+                self._fx_current_border_norm,
+                show_frames,
+                manual_mode,
+            )
         except Exception as e:
             self.preview_label.setText(f"预览失败: {type(e).__name__}: {e}")
+        finally:
+            self._preview_rendering = False
+            if self._preview_dirty:
+                self._preview_debounce_timer.start(self._preview_interval_for_state())
 
     def _build_export_tab(self) -> None:
         layout = QVBoxLayout(self.export_tab)
