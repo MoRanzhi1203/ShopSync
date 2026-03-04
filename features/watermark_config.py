@@ -161,6 +161,30 @@ def refresh_watermark_lists(ctx) -> None:
         if not current_cfg and hasattr(ctx, "final_constrain_inside_checkbox"):
             ctx.final_constrain_inside_checkbox.setChecked(True)
 
+    if hasattr(ctx, "group_wm_selector"):
+        current_group_wm = ctx.group_wm_selector.currentText().strip()
+        ctx.group_wm_selector.blockSignals(True)
+        ctx.group_wm_selector.clear()
+        for p in sorted(ctx.watermark_root.glob("*.png")):
+            ctx.group_wm_selector.addItem(p.stem)
+        if current_group_wm:
+            idx = ctx.group_wm_selector.findText(current_group_wm)
+            if idx >= 0:
+                ctx.group_wm_selector.setCurrentIndex(idx)
+        ctx.group_wm_selector.blockSignals(False)
+
+    if hasattr(ctx, "group_cfg_selector"):
+        current_group_cfg = ctx.group_cfg_selector.currentText().strip()
+        ctx.group_cfg_selector.blockSignals(True)
+        ctx.group_cfg_selector.clear()
+        for p in sorted(ctx.config_root.glob("*.json")):
+            ctx.group_cfg_selector.addItem(p.stem)
+        if current_group_cfg:
+            idx = ctx.group_cfg_selector.findText(current_group_cfg)
+            if idx >= 0:
+                ctx.group_cfg_selector.setCurrentIndex(idx)
+        ctx.group_cfg_selector.blockSignals(False)
+
 
 def current_cfg_obj(ctx, watermark_config_cls: Type) -> Optional[object]:
     wm_name = ctx._selected_wm_filename()

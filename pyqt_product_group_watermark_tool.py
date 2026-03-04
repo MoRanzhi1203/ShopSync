@@ -2,6 +2,7 @@
 import hashlib
 import io
 import json
+import os
 import random
 import shutil
 import sys
@@ -18,6 +19,7 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QListView,
+    QTreeView,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -51,7 +53,6 @@ from features.batch_export import refresh_export_config_list as feature_refresh_
 from features.batch_export import refresh_export_folder_list as feature_refresh_export_folder_list
 from features.import_dedup import run_import_to_internal_library as feature_import_to_internal_library
 from features.product_grouping import build_second_layer as feature_build_second_layer
-from features.product_grouping import pick_candidates as feature_pick_candidates
 from features.product_grouping import resolve_candidate_item_path as feature_resolve_candidate_item_path
 from features.watermark_config import add_watermark_file as feature_add_watermark_file
 from features.watermark_config import apply_wm_settings as feature_apply_wm_settings
@@ -761,6 +762,7 @@ class MainWindow(QMainWindow):
         self._wm_border_user_modified = False
         self._fx_border_user_modified = False
         self._preview_windows: List[ImagePreviewDialog] = []
+        self._import_selected_dirs: List[Path] = []
         self._wm_settings_by_file: Dict[str, Dict[str, int]] = {}
         raw_applied = load_json(self.wm_settings_path, {})
         self._wm_applied_settings_by_file: Dict[str, Dict[str, int]] = {}
@@ -788,18 +790,15 @@ class MainWindow(QMainWindow):
         self.import_tab = QWidget()
         self.group_tab = QWidget()
         self.wm_tab = QWidget()
-        self.export_tab = QWidget()
 
         self.tabs.addTab(self.import_tab, "1) 导入图片")
         self.tabs.addTab(self.wm_tab, "2) 添加水印")
         self.tabs.addTab(self.group_tab, "3) 分组管理")
-        self.tabs.addTab(self.export_tab, "4) 导出图片")
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
         self._build_import_tab()
         self._build_group_tab()
         self._build_wm_tab()
-        self._build_export_tab()
         self.refresh_watermark_lists()
         # Force initial preview render: show base image even without watermark.
         self.update_preview()
@@ -818,7 +817,37 @@ class MainWindow(QMainWindow):
     def _pick_dir(self, line: QLineEdit) -> None:
         d = QFileDialog.getExistingDirectory(self, "选择导入文件夹", str(self.root))
         if d:
+            self._import_selected_dirs = [Path(d).resolve()]
             line.setText(d)
+
+    def _pick_import_dirs_multi(self) -> None:
+        dlg = QFileDialog(self, "选择导入文件夹(可多选)", str(self.root))
+        dlg.setFileMode(QFileDialog.Directory)
+        dlg.setOption(QFileDialog.ShowDirsOnly, True)
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        for v in dlg.findChildren(QListView):
+            v.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        for v in dlg.findChildren(QTreeView):
+            v.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        if dlg.exec_() != QFileDialog.Accepted:
+            return
+        selected: List[Path] = []
+        seen = set()
+        for raw in dlg.selectedFiles():
+            p = Path(raw).resolve()
+            s = str(p)
+            if s in seen:
+                continue
+            seen.add(s)
+            if p.exists() and p.is_dir():
+                selected.append(p)
+        if not selected:
+            return
+        self._import_selected_dirs = selected
+        if len(selected) == 1:
+            self.src_import_line.setText(str(selected[0]))
+        else:
+            self.src_import_line.setText(f"已选择 {len(selected)} 个一级文件夹")
 
     def _pick_file(self, line: QLineEdit, flt: str) -> None:
         p, _ = QFileDialog.getOpenFileName(self, "选择文件", str(self.root), flt)
@@ -830,13 +859,20 @@ class MainWindow(QMainWindow):
         row_layout.setContentsMargins(0, 0, 0, 0)
         row_layout.setSpacing(8)
 
+    def _on_import_source_text_changed(self, txt: str) -> None:
+        t = (txt or "").strip()
+        if t.startswith("已选择 ") and "个一级文件夹" in t:
+            return
+        self._import_selected_dirs = []
+
     def _build_import_tab(self) -> None:
         layout = QVBoxLayout(self.import_tab)
 
         form = QFormLayout()
         self.src_import_line = QLineEdit("")
+        self.src_import_line.textChanged.connect(self._on_import_source_text_changed)
         pick_btn = QPushButton("选择导入文件夹")
-        pick_btn.clicked.connect(lambda: self._pick_dir(self.src_import_line))
+        pick_btn.clicked.connect(self._pick_import_dirs_multi)
         row = QHBoxLayout()
         self._normalize_row_spacing(row)
         row.addWidget(self.src_import_line)
@@ -1683,48 +1719,267 @@ class MainWindow(QMainWindow):
     def _build_group_tab(self) -> None:
         layout = QVBoxLayout(self.group_tab)
 
-        cfg = QGridLayout()
+        cfg_row = QHBoxLayout()
+        self._normalize_row_spacing(cfg_row)
         self.group_count = QSpinBox()
         self.group_count.setRange(1, 999)
-        self.group_count.setValue(3)
-        self.per_group = QSpinBox()
-        self.per_group.setRange(16, 20)
-        self.per_group.setValue(16)
-        self.second_prefix = QLineEdit("第二层前缀")
+        self.group_count.setValue(1)
+        self.group_count.setFixedWidth(84)
+        self.per_group_min = QSpinBox()
+        self.per_group_min.setRange(4, 32)
+        self.per_group_min.setValue(16)
+        self.per_group_min.setFixedWidth(84)
+        self.per_group_max = QSpinBox()
+        self.per_group_max.setRange(4, 32)
+        self.per_group_max.setValue(20)
+        self.per_group_max.setFixedWidth(84)
+        self.per_group_min.valueChanged.connect(self._on_group_size_min_changed)
+        self.per_group_max.valueChanged.connect(self._on_group_size_max_changed)
+        self.group_wm_selector = QComboBox()
+        self.group_wm_selector.setFixedWidth(120)
+        self.group_cfg_selector = QComboBox()
+        self.group_cfg_selector.setFixedWidth(120)
 
-        cfg.addWidget(QLabel("分组数量"), 0, 0)
-        cfg.addWidget(self.group_count, 0, 1)
-        cfg.addWidget(QLabel("每组图片数量"), 0, 2)
-        cfg.addWidget(self.per_group, 0, 3)
-        cfg.addWidget(QLabel("第二层前缀"), 0, 4)
-        cfg.addWidget(self.second_prefix, 0, 5)
-        layout.addLayout(cfg)
-
-        btn_row = QHBoxLayout()
-        self._normalize_row_spacing(btn_row)
-        self.btn_pick_candidates = QPushButton("选择候选图片")
-        self.btn_pick_candidates.clicked.connect(self.pick_candidates)
-        self.btn_build_second = QPushButton("生成第二层文件夹")
+        cfg_row.addWidget(QLabel("分组数量"))
+        cfg_row.addWidget(self.group_count)
+        cfg_row.addWidget(QLabel("每组图片数量"))
+        cfg_row.addWidget(self.per_group_min)
+        cfg_row.addWidget(QLabel("-"))
+        cfg_row.addWidget(self.per_group_max)
+        cfg_row.addWidget(QLabel("水印"))
+        cfg_row.addWidget(self.group_wm_selector)
+        cfg_row.addWidget(QLabel("配置"))
+        cfg_row.addWidget(self.group_cfg_selector)
+        self.btn_build_second = QPushButton("随机抽取(合成)")
         self.btn_build_second.clicked.connect(self.build_second_layer)
-        btn_row.addWidget(self.btn_pick_candidates)
-        btn_row.addWidget(self.btn_build_second)
-        layout.addLayout(btn_row)
+        cfg_row.addWidget(self.btn_build_second)
+        cfg_row.addStretch(1)
+        layout.addLayout(cfg_row)
 
-        self.candidate_list = QListWidget()
-        layout.addWidget(self.candidate_list)
+        self.second_line = QLineEdit(str(self.second_root))
+        self.export_line = QLineEdit(str(self.export_root))
+        self.export_config_selector = QComboBox()
+        group_row = QHBoxLayout()
+        left_col = QVBoxLayout()
+        left_col.addWidget(QLabel("当前分组"))
+        self.second_group_stats_label = QLabel("分组数量: 0  |  图片数量: 0")
+        left_col.addWidget(self.second_group_stats_label)
+        self.second_folder_list = QListWidget()
+        self.second_folder_list.currentItemChanged.connect(self.on_second_group_changed)
+        self.second_folder_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.second_folder_list.customContextMenuRequested.connect(self.on_second_group_context_menu)
+        self.second_folder_list.setMinimumHeight(420)
+        self.second_folder_list.setMaximumWidth(280)
+        left_col.addWidget(self.second_folder_list)
+        left_wrap = QWidget()
+        left_wrap.setLayout(left_col)
+        group_row.addWidget(left_wrap, 0)
 
+        right_col = QVBoxLayout()
+        right_col.addWidget(QLabel("分组管理"))
+        right_ctrl_row = QHBoxLayout()
+        self._normalize_row_spacing(right_ctrl_row)
+        right_ctrl_row.addWidget(QLabel("文件视图模式"))
+        self.second_file_view_mode = QComboBox()
+        self.second_file_view_mode.addItems(["列表视图", "缩略图视图"])
+        self.second_file_view_mode.currentIndexChanged.connect(self.on_second_file_view_mode_changed)
+        right_ctrl_row.addWidget(self.second_file_view_mode)
+        row_h = self.second_file_view_mode.sizeHint().height()
+        self.second_file_view_mode.setFixedHeight(row_h)
+        right_ctrl_row.addStretch(1)
+        self.btn_second_group_refresh = QPushButton("刷新")
+        self.btn_second_group_refresh.clicked.connect(self.refresh_export_folder_list)
+        self.btn_second_group_refresh.setFixedHeight(row_h)
+        right_ctrl_row.addWidget(self.btn_second_group_refresh)
+        ctrl_wrap = QWidget()
+        ctrl_wrap.setLayout(right_ctrl_row)
+        ctrl_wrap.setFixedHeight(row_h)
+        right_col.addWidget(ctrl_wrap)
+
+        self.second_group_file_list = QListWidget()
+        self.second_group_file_list.setMinimumHeight(420)
+        self.second_group_file_list.itemDoubleClicked.connect(self.on_second_file_double_clicked)
+        right_col.addWidget(self.second_group_file_list)
+        right_wrap = QWidget()
+        right_wrap.setLayout(right_col)
+        group_row.addWidget(right_wrap, 1)
+
+        layout.addLayout(group_row, 1)
+
+        log_row = QVBoxLayout()
+        log_row.addWidget(QLabel("分组管理日志"))
         self.group_log = QTextEdit()
         self.group_log.setReadOnly(True)
-        layout.addWidget(self.group_log)
+        self.group_log.setMaximumHeight(150)
+        log_row.addWidget(self.group_log)
+        layout.addLayout(log_row, 0)
+
+        self.export_log = QTextEdit()
+        self.export_log.setReadOnly(True)
+        self.refresh_export_folder_list()
+        self.refresh_export_config_list()
+
+    def _collect_second_group_info(self) -> Tuple[List[Tuple[Path, int]], int]:
+        groups: List[Tuple[Path, int]] = []
+        total_images = 0
+        second_root = Path(self.second_line.text().strip()) if hasattr(self, "second_line") else self.second_root
+        if not second_root.exists():
+            return groups, total_images
+        for d in sorted([p for p in second_root.iterdir() if p.is_dir()]):
+            cnt = len([p for p in d.iterdir() if is_image_file(p)])
+            groups.append((d, cnt))
+            total_images += cnt
+        return groups, total_images
+
+    def _update_second_group_stats(self) -> None:
+        if not hasattr(self, "second_group_stats_label"):
+            return
+        groups, total_images = self._collect_second_group_info()
+        self.second_group_stats_label.setText(f"分组数量: {len(groups)}  |  图片数量: {total_images}")
+
+    def on_second_group_changed(self, current: Optional[QListWidgetItem], _previous: Optional[QListWidgetItem]) -> None:
+        if not hasattr(self, "second_group_file_list"):
+            return
+        self.second_group_file_list.clear()
+        if current is None:
+            return
+        p = current.data(Qt.UserRole)
+        if not p:
+            return
+        group_dir = Path(str(p))
+        if not group_dir.exists() or not group_dir.is_dir():
+            return
+        mode = self.second_file_view_mode.currentText() if hasattr(self, "second_file_view_mode") else "列表视图"
+        imgs = [x for x in sorted(group_dir.iterdir()) if is_image_file(x)]
+        if mode == "缩略图视图":
+            icon_size = QSize(120, 120)
+            self.second_group_file_list.setViewMode(QListWidget.IconMode)
+            self.second_group_file_list.setIconSize(icon_size)
+            self.second_group_file_list.setGridSize(QSize(150, 165))
+            self.second_group_file_list.setResizeMode(QListWidget.Adjust)
+            for pth in imgs:
+                try:
+                    qpix = QPixmap(str(pth))
+                    if qpix.isNull():
+                        continue
+                    icon = QIcon(qpix.scaled(icon_size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    it = QListWidgetItem(icon, pth.name)
+                    it.setData(Qt.UserRole, str(pth))
+                    self.second_group_file_list.addItem(it)
+                except Exception:
+                    continue
+            return
+        self.second_group_file_list.setViewMode(QListWidget.ListMode)
+        self.second_group_file_list.setIconSize(QSize(20, 20))
+        self.second_group_file_list.setGridSize(QSize())
+        self.second_group_file_list.setResizeMode(QListWidget.Fixed)
+        for pth in imgs:
+            it = QListWidgetItem(pth.name)
+            it.setData(Qt.UserRole, str(pth))
+            self.second_group_file_list.addItem(it)
+
+    def on_second_file_view_mode_changed(self, _idx: int) -> None:
+        self.on_second_group_changed(self.second_folder_list.currentItem(), None)
+
+    def on_second_group_context_menu(self, pos) -> None:
+        item = self.second_folder_list.itemAt(pos)
+        if item is None:
+            return
+        raw = item.data(Qt.UserRole)
+        if not raw:
+            return
+        group_dir = Path(str(raw))
+        if not group_dir.exists() or not group_dir.is_dir():
+            return
+        menu = QMenu(self)
+        act_open = menu.addAction("打开文件夹")
+        act_export = menu.addAction("导出")
+        act_delete = menu.addAction("删除")
+        chosen = menu.exec_(self.second_folder_list.mapToGlobal(pos))
+        if chosen == act_open:
+            self.open_second_group_folder(group_dir)
+            return
+        if chosen == act_export:
+            self.export_second_group(group_dir, item)
+            return
+        if chosen == act_delete:
+            self.delete_second_group(group_dir)
+            return
+
+    def open_second_group_folder(self, group_dir: Path) -> None:
+        try:
+            os.startfile(str(group_dir))
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"打开失败: {type(e).__name__}: {e}")
+
+    def export_second_group(self, group_dir: Path, item: Optional[QListWidgetItem] = None) -> None:
+        if not group_dir.exists() or not group_dir.is_dir():
+            QMessageBox.warning(self, "提示", "分组不存在")
+            return
+        if item is None:
+            for i in range(self.second_folder_list.count()):
+                it = self.second_folder_list.item(i)
+                if str(it.data(Qt.UserRole)) == str(group_dir):
+                    item = it
+                    break
+        self.second_folder_list.clearSelection()
+        if item is not None:
+            item.setSelected(True)
+            self.second_folder_list.setCurrentItem(item)
+        self.batch_export()
+        self._log(self.group_log, f"导出分组: {group_dir.name}")
+
+    def delete_second_group(self, group_dir: Path) -> None:
+        ans = QMessageBox.question(
+            self,
+            "删除分组",
+            f"确定删除 {group_dir.name} 分组吗？将会删除该分组及其所有图片",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            shutil.rmtree(group_dir)
+            self._log(self.group_log, f"删除分组: {group_dir.name}")
+            self.refresh_export_folder_list()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"{type(e).__name__}: {e}")
+
+    def on_second_file_double_clicked(self, item: QListWidgetItem) -> None:
+        if item is None:
+            return
+        raw = item.data(Qt.UserRole)
+        if not raw:
+            return
+        p = Path(str(raw))
+        if p.exists() and p.is_file():
+            self.view_internal_file(p)
 
     def pick_candidates(self) -> None:
-        feature_pick_candidates(self, list_images=list_images)
+        return
+
+    def _on_group_size_min_changed(self, v: int) -> None:
+        if v > self.per_group_max.value():
+            self.per_group_max.setValue(v)
+
+    def _on_group_size_max_changed(self, v: int) -> None:
+        if v < self.per_group_min.value():
+            self.per_group_min.setValue(v)
 
     def _resolve_candidate_item_path(self, item: QListWidgetItem) -> Optional[Path]:
         return feature_resolve_candidate_item_path(self, item)
 
     def build_second_layer(self) -> None:
-        feature_build_second_layer(self, next_folder_index=next_folder_index, ensure_dir=ensure_dir)
+        feature_build_second_layer(
+            self,
+            list_images=list_images,
+            load_json=load_json,
+            apply_watermark=apply_watermark,
+            ensure_dir=ensure_dir,
+            next_folder_index=next_folder_index,
+            watermark_config_cls=WatermarkConfig,
+        )
 
     def _build_wm_tab(self) -> None:
         layout = QHBoxLayout(self.wm_tab)
@@ -2952,7 +3207,29 @@ class MainWindow(QMainWindow):
         feature_refresh_export_config_list(self)
 
     def refresh_export_folder_list(self) -> None:
+        prev_path = None
+        if hasattr(self, "second_folder_list"):
+            cur = self.second_folder_list.currentItem()
+            if cur is not None:
+                prev_path = cur.data(Qt.UserRole)
         feature_refresh_export_folder_list(self, is_image_file=is_image_file)
+        self._update_second_group_stats()
+        if not hasattr(self, "second_folder_list"):
+            return
+        target_row = -1
+        if prev_path:
+            for i in range(self.second_folder_list.count()):
+                it = self.second_folder_list.item(i)
+                if str(it.data(Qt.UserRole)) == str(prev_path):
+                    target_row = i
+                    break
+        if target_row < 0 and self.second_folder_list.count() > 0:
+            target_row = 0
+        if target_row >= 0:
+            self.second_folder_list.setCurrentRow(target_row)
+            self.on_second_group_changed(self.second_folder_list.currentItem(), None)
+        elif hasattr(self, "second_group_file_list"):
+            self.second_group_file_list.clear()
 
     def batch_export(self) -> None:
         feature_batch_export(

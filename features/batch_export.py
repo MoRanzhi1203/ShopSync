@@ -28,8 +28,6 @@ def refresh_export_folder_list(ctx, *, is_image_file: Callable[[Path], bool]) ->
         cnt = len([p for p in d.iterdir() if is_image_file(p)])
         item = QListWidgetItem(f"{d.name} ({cnt} 张)")
         item.setData(Qt.UserRole, str(d))
-        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-        item.setCheckState(Qt.Checked)
         ctx.second_folder_list.addItem(item)
 
 
@@ -69,10 +67,19 @@ def batch_export(
     ensure_dir(export_root)
 
     selected_dirs: List[Path] = []
+    has_checkable = False
     for i in range(ctx.second_folder_list.count()):
         it = ctx.second_folder_list.item(i)
-        if it.checkState() == Qt.Checked:
-            selected_dirs.append(Path(it.data(Qt.UserRole)))
+        if bool(it.flags() & Qt.ItemIsUserCheckable):
+            has_checkable = True
+            if it.checkState() == Qt.Checked:
+                selected_dirs.append(Path(it.data(Qt.UserRole)))
+    if not has_checkable:
+        selected_items = ctx.second_folder_list.selectedItems()
+        if selected_items:
+            selected_dirs = [Path(it.data(Qt.UserRole)) for it in selected_items]
+        else:
+            selected_dirs = [Path(ctx.second_folder_list.item(i).data(Qt.UserRole)) for i in range(ctx.second_folder_list.count())]
     if not selected_dirs:
         QMessageBox.warning(ctx, "提示", "请至少勾选一个二层文件夹")
         return
