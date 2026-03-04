@@ -33,6 +33,9 @@ from PyQt5.QtWidgets import (
     QSpinBox,
     QTabWidget,
     QTextEdit,
+    QInputDialog,
+    QMenu,
+    QDialog,
     QVBoxLayout,
     QWidget,
     QComboBox,
@@ -94,6 +97,39 @@ class ThumbnailWorker(QObject):
                     self.thumbnail_ready.emit(row, QIcon())
         finally:
             self.finished.emit()
+
+
+class ImagePreviewDialog(QDialog):
+    def __init__(self, image_path: Path, parent=None) -> None:
+        super().__init__(parent)
+        self.image_path = image_path
+        self.setWindowTitle(f"查看图片 - {image_path.name}")
+        self.resize(1100, 760)
+        self.label = QLabel()
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setStyleSheet("background:#222; color:#ddd;")
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.label)
+        self._pix = QPixmap(str(image_path))
+        if self._pix.isNull():
+            self.label.setText("图片加载失败")
+        else:
+            self._refresh_pixmap()
+
+    def _refresh_pixmap(self) -> None:
+        if self._pix.isNull():
+            return
+        scaled = self._pix.scaled(
+            max(1, self.label.width() - 8),
+            max(1, self.label.height() - 8),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.label.setPixmap(scaled)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh_pixmap()
 
 
 def ensure_dir(path: Path) -> None:
@@ -266,11 +302,13 @@ class MainWindow(QMainWindow):
         self.watermark_root = self.root / "watermark_library" / "images"
         self.config_root = self.root / "watermark_library" / "configs"
         self.index_path = self.root / "internal_library" / "md5_index.json"
+        self.settings_path = self.root / "app_settings.json"
 
         for p in [self.internal_root, self.second_root, self.export_root, self.watermark_root, self.config_root]:
             ensure_dir(p)
 
         self.md5_index: Dict[str, str] = load_json(self.index_path, {})
+        self.app_settings: Dict[str, str] = load_json(self.settings_path, {})
         self.candidate_images: List[Path] = []
         self.current_internal_group_dir: Optional[Path] = None
         self._pending_group_dir: Optional[Path] = None
@@ -283,6 +321,7 @@ class MainWindow(QMainWindow):
         self._group_switch_timer = QTimer(self)
         self._group_switch_timer.setSingleShot(True)
         self._group_switch_timer.timeout.connect(self._apply_pending_group_change)
+        self._preview_windows: List[ImagePreviewDialog] = []
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -339,8 +378,12 @@ class MainWindow(QMainWindow):
         group_row = QHBoxLayout()
         left_col = QVBoxLayout()
         left_col.addWidget(QLabel("当前分组"))
+        self.internal_group_stats_label = QLabel("分组: 0  |  总图片: 0")
+        left_col.addWidget(self.internal_group_stats_label)
         self.internal_group_list = QListWidget()
         self.internal_group_list.currentItemChanged.connect(self.on_internal_group_changed)
+        self.internal_group_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.internal_group_list.customContextMenuRequested.connect(self.on_internal_group_context_menu)
         self.internal_group_list.setMinimumHeight(420)
         self.internal_group_list.setMaximumWidth(280)
         left_col.addWidget(self.internal_group_list)
@@ -355,13 +398,33 @@ class MainWindow(QMainWindow):
         self.internal_file_view_mode = QComboBox()
         self.internal_file_view_mode.addItems(["详细信息", "大图标"])
         self.internal_file_view_mode.currentIndexChanged.connect(self.on_internal_file_view_mode_changed)
+        last_mode = self.app_settings.get("internal_file_view_mode", "大图标")
+        idx = self.internal_file_view_mode.findText(last_mode)
+        if idx >= 0:
+            self.internal_file_view_mode.setCurrentIndex(idx)
         mode_row.addWidget(self.internal_file_view_mode)
+        self.btn_file_select_all = QPushButton("全选")
+        self.btn_file_select_all.clicked.connect(self.select_all_files)
+        mode_row.addWidget(self.btn_file_select_all)
+        self.btn_file_select_none = QPushButton("全不选")
+        self.btn_file_select_none.clicked.connect(self.clear_file_selection)
+        mode_row.addWidget(self.btn_file_select_none)
+        self.btn_batch_move = QPushButton("批量移动")
+        self.btn_batch_move.clicked.connect(self.batch_move_files)
+        mode_row.addWidget(self.btn_batch_move)
+        self.btn_batch_delete = QPushButton("批量删除")
+        self.btn_batch_delete.clicked.connect(self.batch_delete_files)
+        mode_row.addWidget(self.btn_batch_delete)
         mode_row.addStretch(1)
         mode_wrap = QWidget()
         mode_wrap.setLayout(mode_row)
         mid_col.addWidget(mode_wrap)
         self.internal_group_file_list = QListWidget()
         self.internal_group_file_list.setMinimumHeight(420)
+        self.internal_group_file_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.internal_group_file_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.internal_group_file_list.customContextMenuRequested.connect(self.on_internal_file_context_menu)
+        self.internal_group_file_list.itemDoubleClicked.connect(self.on_internal_file_double_clicked)
         self.internal_group_file_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.internal_group_file_list.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.internal_group_file_list.setUniformItemSizes(True)
@@ -383,22 +446,407 @@ class MainWindow(QMainWindow):
 
         self.refresh_internal_group_list()
 
+    def _collect_internal_group_info(self) -> Tuple[List[Tuple[Path, int]], int]:
+        groups: List[Tuple[Path, int]] = []
+        total_images = 0
+        if not self.internal_root.exists():
+            return groups, total_images
+        for d in sorted(self.internal_root.iterdir()):
+            if not d.is_dir():
+                continue
+            cnt = len([p for p in d.iterdir() if is_image_file(p)])
+            groups.append((d, cnt))
+            total_images += cnt
+        return groups, total_images
+
+    def _update_internal_group_stats(self, group_count: int, total_images: int) -> None:
+        self.internal_group_stats_label.setText(f"分组: {group_count}  |  总图片: {total_images}")
+        QApplication.processEvents()
+
+    def refresh_internal_group_overview(self) -> None:
+        # Lightweight refresh for import stage: update left grouping panel and stats.
+        selected_dir = None
+        cur = self.internal_group_list.currentItem()
+        if cur is not None:
+            raw = cur.data(Qt.UserRole)
+            if raw:
+                selected_dir = str(raw)
+
+        groups, total_images = self._collect_internal_group_info()
+        self.internal_group_list.blockSignals(True)
+        self.internal_group_list.clear()
+        for d, cnt in groups:
+            it = QListWidgetItem(f"{d.name} ({cnt} 张)")
+            it.setData(Qt.UserRole, str(d))
+            self.internal_group_list.addItem(it)
+        if selected_dir:
+            for i in range(self.internal_group_list.count()):
+                it = self.internal_group_list.item(i)
+                if it and str(it.data(Qt.UserRole)) == selected_dir:
+                    self.internal_group_list.setCurrentRow(i)
+                    break
+        elif self.internal_group_list.count() > 0:
+            self.internal_group_list.setCurrentRow(0)
+        self.internal_group_list.blockSignals(False)
+        self._update_internal_group_stats(len(groups), total_images)
+
     def refresh_internal_group_list(self) -> None:
         self._stop_thumbnail_worker()
         self.internal_group_list.clear()
         self.internal_group_file_list.clear()
         self.current_internal_group_dir = None
-        if not self.internal_root.exists():
-            return
-        for d in sorted(self.internal_root.iterdir()):
-            if not d.is_dir():
-                continue
-            cnt = len([p for p in d.iterdir() if is_image_file(p)])
+        groups, total_images = self._collect_internal_group_info()
+        for d, cnt in groups:
             it = QListWidgetItem(f"{d.name} ({cnt} 张)")
             it.setData(Qt.UserRole, str(d))
             self.internal_group_list.addItem(it)
         if self.internal_group_list.count() > 0:
             self.internal_group_list.setCurrentRow(0)
+        self._update_internal_group_stats(len(groups), total_images)
+
+    def _remap_md5_index_paths(self, old_prefix: Path, new_prefix: Path) -> None:
+        old_norm = str(old_prefix.relative_to(self.root)).replace("\\", "/")
+        new_norm = str(new_prefix.relative_to(self.root)).replace("\\", "/")
+        if not old_norm.endswith("/"):
+            old_norm += "/"
+        if not new_norm.endswith("/"):
+            new_norm += "/"
+
+        remapped: Dict[str, str] = {}
+        for k, v in self.md5_index.items():
+            vv = str(v).replace("\\", "/")
+            if vv.startswith(old_norm):
+                vv = new_norm + vv[len(old_norm) :]
+            remapped[k] = vv.replace("/", "\\")
+        self.md5_index = remapped
+        save_json(self.index_path, self.md5_index)
+
+    def on_internal_group_context_menu(self, pos) -> None:
+        item = self.internal_group_list.itemAt(pos)
+        if item is None:
+            menu = QMenu(self)
+            act_create = menu.addAction("创建新分组")
+            act_clear_empty = menu.addAction("清除空分组")
+            chosen = menu.exec_(self.internal_group_list.mapToGlobal(pos))
+            if chosen == act_create:
+                self.create_internal_group()
+            if chosen == act_clear_empty:
+                self.clear_empty_groups()
+            return
+        raw = item.data(Qt.UserRole)
+        if not raw:
+            return
+        group_dir = Path(str(raw))
+        if not group_dir.exists() or not group_dir.is_dir():
+            return
+
+        menu = QMenu(self)
+        act_rename = menu.addAction("重命名分组")
+        act_delete = menu.addAction("删除分组")
+        act_clear_empty = menu.addAction("清除空分组")
+        chosen = menu.exec_(self.internal_group_list.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == act_rename:
+            self.rename_internal_group(group_dir)
+            return
+        if chosen == act_delete:
+            self.delete_internal_group(group_dir)
+            return
+        if chosen == act_clear_empty:
+            self.clear_empty_groups()
+            return
+
+    def create_internal_group(self) -> None:
+        name, ok = QInputDialog.getText(self, "创建新分组", "分组名称：")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(self, "错误", "分组名称不能为空")
+            return
+        invalid = set('<>:"/\\|?*')
+        if any(ch in invalid for ch in name):
+            QMessageBox.warning(self, "错误", "分组名称包含非法字符")
+            return
+        target = self.internal_root / name
+        if target.exists():
+            QMessageBox.warning(self, "错误", f"分组已存在: {name}")
+            return
+        ensure_dir(target)
+        self._log(self.import_log, f"已创建新分组: {name}")
+        self.refresh_internal_group_list()
+        self.select_internal_group(target)
+
+    def clear_empty_groups(self) -> None:
+        groups = [d for d in sorted(self.internal_root.iterdir()) if d.is_dir()]
+        empty_groups = []
+        for d in groups:
+            has_images = any(is_image_file(p) for p in d.iterdir() if p.is_file())
+            has_subdirs = any(p.is_dir() for p in d.iterdir())
+            has_other_files = any(p.is_file() for p in d.iterdir() if not is_image_file(p))
+            if not has_images and not has_subdirs and not has_other_files:
+                empty_groups.append(d)
+        if not empty_groups:
+            QMessageBox.information(self, "提示", "没有可清除的空分组")
+            return
+        ans = QMessageBox.question(
+            self,
+            "清除空分组",
+            f"确认清除 {len(empty_groups)} 个空分组吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        removed = 0
+        for d in empty_groups:
+            try:
+                d.rmdir()
+                removed += 1
+            except Exception:
+                continue
+        self._log(self.import_log, f"已清除空分组 {removed} 个")
+        self.refresh_internal_group_list()
+
+    def select_internal_group(self, group_dir: Path) -> None:
+        for i in range(self.internal_group_list.count()):
+            it = self.internal_group_list.item(i)
+            if it and str(it.data(Qt.UserRole)) == str(group_dir):
+                self.internal_group_list.setCurrentRow(i)
+                return
+
+    def rename_internal_group(self, old_dir: Path) -> None:
+        old_name = old_dir.name
+        new_name, ok = QInputDialog.getText(self, "重命名分组", "新分组名称：", text=old_name)
+        if not ok:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            QMessageBox.warning(self, "错误", "分组名称不能为空")
+            return
+        invalid = set('<>:"/\\|?*')
+        if any(ch in invalid for ch in new_name):
+            QMessageBox.warning(self, "错误", "分组名称包含非法字符")
+            return
+        if new_name == old_name:
+            return
+
+        new_dir = old_dir.parent / new_name
+        if new_dir.exists():
+            QMessageBox.warning(self, "错误", f"目标分组已存在: {new_name}")
+            return
+
+        self._stop_thumbnail_worker()
+        self._group_switch_timer.stop()
+        try:
+            old_dir.rename(new_dir)
+            imgs = [p for p in sorted(new_dir.iterdir()) if is_image_file(p)]
+
+            # Two-phase rename to avoid collisions.
+            temp_files: List[Path] = []
+            for i, p in enumerate(imgs, 1):
+                tmp = new_dir / f"__tmp_rename__{i:04d}{p.suffix.lower()}"
+                p.rename(tmp)
+                temp_files.append(tmp)
+            for i, tmp in enumerate(temp_files, 1):
+                final = new_dir / f"{new_name}{i:03d}{tmp.suffix.lower()}"
+                tmp.rename(final)
+
+            self._remap_md5_index_paths(old_dir, new_dir)
+            self._log(self.import_log, f"分组重命名: {old_name} -> {new_name}，并同步重命名 {len(temp_files)} 个文件")
+            self.refresh_internal_group_list()
+            self.select_internal_group(new_dir)
+        except Exception as e:
+            QMessageBox.critical(self, "重命名失败", f"{type(e).__name__}: {e}")
+
+    def delete_internal_group(self, group_dir: Path) -> None:
+        name = group_dir.name
+        ans = QMessageBox.question(
+            self,
+            "删除分组",
+            f"确认删除分组“{name}”及其全部文件吗？此操作不可恢复。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+
+        self._stop_thumbnail_worker()
+        self._group_switch_timer.stop()
+        try:
+            shutil.rmtree(group_dir)
+            prefix = str(group_dir.relative_to(self.root)).replace("\\", "/") + "/"
+            self.md5_index = {
+                k: v
+                for k, v in self.md5_index.items()
+                if not str(v).replace("\\", "/").startswith(prefix)
+            }
+            save_json(self.index_path, self.md5_index)
+            self._log(self.import_log, f"分组已删除: {name}")
+            self.refresh_internal_group_list()
+        except Exception as e:
+            QMessageBox.critical(self, "删除失败", f"{type(e).__name__}: {e}")
+
+    def on_internal_file_double_clicked(self, item: QListWidgetItem) -> None:
+        if item is None:
+            return
+        raw = item.data(Qt.UserRole)
+        if not raw:
+            return
+        p = Path(str(raw))
+        self.view_internal_file(p)
+
+    def on_internal_file_context_menu(self, pos) -> None:
+        item = self.internal_group_file_list.itemAt(pos)
+        if item is None:
+            return
+        raw = item.data(Qt.UserRole)
+        if not raw:
+            return
+        p = Path(str(raw))
+        if not p.exists():
+            return
+
+        menu = QMenu(self)
+        act_view = menu.addAction("查看")
+        act_move = menu.addAction("移动到其他分组")
+        act_delete = menu.addAction("删除")
+        chosen = menu.exec_(self.internal_group_file_list.mapToGlobal(pos))
+        if chosen == act_view:
+            self.view_internal_file(p)
+            return
+        if chosen == act_move:
+            self.move_files_to_other_group([p])
+            return
+        if chosen == act_delete:
+            self.delete_internal_files([p])
+            return
+
+    def view_internal_file(self, path: Path) -> None:
+        if not path.exists():
+            QMessageBox.warning(self, "错误", "文件不存在")
+            return
+        dlg = ImagePreviewDialog(path, self)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        dlg.destroyed.connect(lambda _=None, d=dlg: self._preview_windows.remove(d) if d in self._preview_windows else None)
+        self._preview_windows.append(dlg)
+        dlg.show()
+
+    def _selected_internal_file_paths(self) -> List[Path]:
+        out: List[Path] = []
+        for it in self.internal_group_file_list.selectedItems():
+            raw = it.data(Qt.UserRole)
+            if not raw:
+                continue
+            p = Path(str(raw))
+            if p.exists() and p.is_file():
+                out.append(p)
+        return out
+
+    def select_all_files(self) -> None:
+        self.internal_group_file_list.selectAll()
+
+    def clear_file_selection(self) -> None:
+        self.internal_group_file_list.clearSelection()
+
+    def choose_target_group(self, exclude: Optional[Path] = None) -> Optional[Path]:
+        groups = [d for d in sorted(self.internal_root.iterdir()) if d.is_dir()]
+        if exclude is not None:
+            groups = [d for d in groups if d != exclude]
+        if not groups:
+            QMessageBox.warning(self, "提示", "没有可选的目标分组")
+            return None
+        names = [d.name for d in groups]
+        name, ok = QInputDialog.getItem(self, "选择目标分组", "目标分组：", names, 0, False)
+        if not ok or not name:
+            return None
+        return self.internal_root / name
+
+    def _remap_single_md5_path(self, old_path: Path, new_path: Path) -> None:
+        old_rel = str(old_path.relative_to(self.root)).replace("\\", "/")
+        new_rel = str(new_path.relative_to(self.root)).replace("\\", "/")
+        for k, v in list(self.md5_index.items()):
+            vv = str(v).replace("\\", "/")
+            if vv == old_rel:
+                self.md5_index[k] = new_rel.replace("/", "\\")
+                break
+
+    def _remove_md5_entries_by_paths(self, paths: List[Path]) -> None:
+        targets = {str(p.relative_to(self.root)).replace("\\", "/") for p in paths if p.exists() or p.parent.exists()}
+        self.md5_index = {
+            k: v
+            for k, v in self.md5_index.items()
+            if str(v).replace("\\", "/") not in targets
+        }
+
+    def move_files_to_other_group(self, files: List[Path]) -> None:
+        if not files:
+            QMessageBox.information(self, "提示", "请先选择文件")
+            return
+        src_group = files[0].parent
+        target_group = self.choose_target_group(exclude=src_group)
+        if target_group is None:
+            return
+        ensure_dir(target_group)
+
+        moved = 0
+        next_idx = next_image_index_in_folder(target_group, target_group.name)
+        try:
+            for p in files:
+                if not p.exists():
+                    continue
+                ext = p.suffix.lower()
+                dst = target_group / f"{target_group.name}{next_idx:03d}{ext}"
+                next_idx += 1
+                p.rename(dst)
+                self._remap_single_md5_path(p, dst)
+                moved += 1
+            save_json(self.index_path, self.md5_index)
+            self._log(self.import_log, f"已移动 {moved} 张到分组: {target_group.name}")
+            self.refresh_internal_group_list()
+            self.select_internal_group(src_group if src_group.exists() else target_group)
+        except Exception as e:
+            QMessageBox.critical(self, "移动失败", f"{type(e).__name__}: {e}")
+
+    def delete_internal_files(self, files: List[Path]) -> None:
+        if not files:
+            QMessageBox.information(self, "提示", "请先选择文件")
+            return
+        ans = QMessageBox.question(
+            self,
+            "删除文件",
+            f"确认删除选中的 {len(files)} 个文件吗？此操作不可恢复。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        deleted_paths: List[Path] = []
+        deleted = 0
+        for p in files:
+            try:
+                if p.exists():
+                    p.unlink()
+                    deleted += 1
+                    deleted_paths.append(p)
+            except Exception:
+                continue
+        self._remove_md5_entries_by_paths(deleted_paths)
+        save_json(self.index_path, self.md5_index)
+        self._log(self.import_log, f"已删除文件 {deleted} 个")
+        keep_group = self.current_internal_group_dir if self.current_internal_group_dir else None
+        self.refresh_internal_group_list()
+        if keep_group and keep_group.exists():
+            self.select_internal_group(keep_group)
+
+    def batch_move_files(self) -> None:
+        files = self._selected_internal_file_paths()
+        self.move_files_to_other_group(files)
+
+    def batch_delete_files(self) -> None:
+        files = self._selected_internal_file_paths()
+        self.delete_internal_files(files)
 
     def on_internal_group_changed(self, current: Optional[QListWidgetItem], previous: Optional[QListWidgetItem]) -> None:
         _ = previous
@@ -427,6 +875,8 @@ class MainWindow(QMainWindow):
         self.populate_internal_group_files(group_dir)
 
     def on_internal_file_view_mode_changed(self, _idx: int) -> None:
+        self.app_settings["internal_file_view_mode"] = self.internal_file_view_mode.currentText()
+        save_json(self.settings_path, self.app_settings)
         if self.current_internal_group_dir and self.current_internal_group_dir.exists():
             self.populate_internal_group_files(self.current_internal_group_dir)
 
@@ -633,12 +1083,15 @@ class MainWindow(QMainWindow):
                     self.md5_index[h] = str(dst.relative_to(self.root))
                     imported += 1
                     next_idx += 1
+                    if imported % 10 == 0:
+                        self.refresh_internal_group_overview()
 
                 final_count = len([p for p in dst_folder.iterdir() if is_image_file(p)])
                 if final_count < 50:
                     self._log(self.import_log, f"{base_name}: 当前总数 {final_count} (<50)，建议后续补图")
                 else:
                     self._log(self.import_log, f"{base_name}: 新增 {len(new_items)} 张，当前总数 {final_count} 张")
+                self.refresh_internal_group_overview()
         finally:
             self.setEnabled(True)
             progress.setValue(progress.maximum())
