@@ -304,6 +304,7 @@ class WatermarkComboDelegate(QStyledItemDelegate):
 
 class OverlayPreviewLabel(QLabel):
     borderChanged = pyqtSignal(object)
+    overlayDragged = pyqtSignal(float, float)
 
     def __init__(self, text: str = "", parent=None) -> None:
         super().__init__(text, parent)
@@ -313,6 +314,9 @@ class OverlayPreviewLabel(QLabel):
         self._show_frames = False
         self._manual_mode = False
         self._drag_edge: Optional[str] = None
+        self._drag_move = False
+        self._drag_last_x = 0
+        self._drag_last_y = 0
 
     def set_overlay_rects(
         self,
@@ -394,6 +398,20 @@ class OverlayPreviewLabel(QLabel):
     def mousePressEvent(self, event) -> None:
         if (
             event.button() == Qt.LeftButton
+            and self._manual_mode
+            and self._current_rect_norm is not None
+        ):
+            p_rect = self._pix_rect()
+            if p_rect is not None:
+                cr = self._norm_to_rect(self._current_rect_norm, p_rect)
+                if cr.contains(event.x(), event.y()):
+                    self._drag_move = True
+                    self._drag_last_x = event.x()
+                    self._drag_last_y = event.y()
+                    event.accept()
+                    return
+        if (
+            event.button() == Qt.LeftButton
             and self._show_frames
             and self._manual_mode
             and self._current_rect_norm is not None
@@ -409,6 +427,17 @@ class OverlayPreviewLabel(QLabel):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if self._drag_move:
+            p_rect = self._pix_rect()
+            if p_rect is None or p_rect.width() <= 0 or p_rect.height() <= 0:
+                return
+            dx_px = event.x() - self._drag_last_x
+            dy_px = event.y() - self._drag_last_y
+            self._drag_last_x = event.x()
+            self._drag_last_y = event.y()
+            self.overlayDragged.emit(dx_px / float(p_rect.width()), dy_px / float(p_rect.height()))
+            event.accept()
+            return
         if self._drag_edge and self._current_rect_norm is not None:
             p_rect = self._pix_rect()
             if p_rect is None or p_rect.width() <= 0 or p_rect.height() <= 0:
@@ -437,6 +466,7 @@ class OverlayPreviewLabel(QLabel):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        self._drag_move = False
         self._drag_edge = None
         super().mouseReleaseEvent(event)
 
@@ -1687,6 +1717,7 @@ class MainWindow(QMainWindow):
         self.current_wm_preview.setMinimumHeight(120)
         self.current_wm_preview.setMaximumHeight(120)
         self.current_wm_preview.setStyleSheet("border: 1px solid #999;")
+        self.preview_label.overlayDragged.connect(self._on_effect_overlay_dragged)
         self.current_wm_name = QLabel("当前水印名称")
         self.current_wm_name.setAlignment(Qt.AlignCenter)
         self.current_wm_name.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
@@ -1895,8 +1926,9 @@ class MainWindow(QMainWindow):
         wm_processed: Image.Image,
         target_w: int,
         target_h: int,
+        cache_tag: Tuple[object, ...],
     ) -> Tuple[QPixmap, Tuple[float, float, float, float]]:
-        key = (self._wm_sim_cache_key, target_w, target_h)
+        key = (cache_tag, target_w, target_h)
         if (
             self._wm_preview_pix_cache_key == key
             and self._wm_preview_pix_cache_img is not None
@@ -1906,7 +1938,7 @@ class MainWindow(QMainWindow):
 
         w = max(1, target_w)
         h = max(1, target_h)
-        padding = 2
+        padding = 1
         wm_thumb_src = pil_to_qpixmap(wm_processed)
         if wm_thumb_src.isNull():
             return QPixmap(), (0.0, 0.0, 1.0, 1.0)
@@ -1986,6 +2018,12 @@ class MainWindow(QMainWindow):
         self._fx_current_border_norm = None
         self.update_preview()
 
+    def _on_effect_overlay_dragged(self, dx_norm: float, dy_norm: float) -> None:
+        x = self.final_x_slider.value() + int(round(dx_norm * 100))
+        y = self.final_y_slider.value() + int(round(dy_norm * 100))
+        self.final_x_slider.setValue(max(0, min(100, x)))
+        self.final_y_slider.setValue(max(0, min(100, y)))
+
     def refresh_watermark_lists(self) -> None:
         feature_refresh_watermark_lists(self)
 
@@ -2031,14 +2069,23 @@ class MainWindow(QMainWindow):
             wm_name = self._selected_wm_filename()
             wm_path = self.watermark_root / wm_name if wm_name else None
             if wm_path is not None and wm_path.exists():
-                wm_processed = self._get_cached_simulated_wm(wm_path, fast_mode=fast_mode)
-                wm_thumb, wm_preview_bbox_norm = self._get_cached_wm_preview_pix(
-                    wm_processed,
+                wm_raw_actual = self._get_cached_wm_raw(wm_path)
+                wm_processed_current = self._get_cached_simulated_wm(wm_path, fast_mode=fast_mode)
+                wm_stat = wm_path.stat()
+                wm_thumb, wm_current_bbox_norm = self._get_cached_wm_preview_pix(
+                    wm_processed_current,
                     max(1, self.current_wm_preview.width() - 2),
                     max(1, self.current_wm_preview.height() - 2),
+                    cache_tag=("wm_preview_current", str(wm_path), wm_stat.st_mtime, self.wm_rotate_slider.value(), self.wm_opacity_slider.value()),
                 )
-                self._wm_actual_border_norm = wm_preview_bbox_norm
-                self._wm_current_border_norm = self._wm_actual_border_norm
+                _, wm_actual_bbox_norm = self._get_cached_wm_preview_pix(
+                    wm_raw_actual,
+                    max(1, self.current_wm_preview.width() - 2),
+                    max(1, self.current_wm_preview.height() - 2),
+                    cache_tag=("wm_preview_actual", str(wm_path), wm_stat.st_mtime),
+                )
+                self._wm_actual_border_norm = wm_actual_bbox_norm
+                self._wm_current_border_norm = wm_current_bbox_norm
                 if not wm_thumb.isNull():
                     self.current_wm_preview.setPixmap(wm_thumb)
                     self.current_wm_preview.setText("")
@@ -2047,12 +2094,16 @@ class MainWindow(QMainWindow):
                     self.current_wm_preview.setText("姘村嵃棰勮澶辫触")
                 self.current_wm_name.setText(wm_path.stem)
                 # Two-layer simulation for effect preview; no persistent image data change.
-                effect_preview, self._fx_actual_border_norm = self._compose_effect_preview(
+                effect_preview, self._fx_current_border_norm = self._compose_effect_preview(
                     base_preview,
-                    wm_processed,
+                    wm_processed_current,
                     fast_mode=fast_mode,
                 )
-                self._fx_current_border_norm = self._fx_actual_border_norm
+                _, self._fx_actual_border_norm = self._compose_effect_preview(
+                    base_preview,
+                    wm_raw_actual,
+                    fast_mode=fast_mode,
+                )
             else:
                 empty = self._render_checkerboard_preview(QPixmap(), max(1, self.current_wm_preview.width() - 2), max(1, self.current_wm_preview.height() - 2))
                 self.current_wm_preview.setPixmap(empty)
@@ -2080,7 +2131,7 @@ class MainWindow(QMainWindow):
                 self._fx_actual_border_norm,
                 self._fx_current_border_norm,
                 show_frames,
-                False,
+                wm_path is not None and wm_path.exists(),
             )
         except Exception as e:
             self.preview_label.setText(f"预览错误: {type(e).__name__}: {e}")
