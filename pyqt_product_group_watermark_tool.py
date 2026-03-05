@@ -848,6 +848,10 @@ class MainWindow(QMainWindow):
         self._fx_border_user_modified = False
         self._preview_windows: List[ImagePreviewDialog] = []
         self._import_selected_dirs: List[Path] = []
+        self._import_stop_mode: Optional[str] = None
+        self._import_paused: bool = False
+        self._group_stop_mode: Optional[str] = None
+        self._group_paused: bool = False
         self._wm_settings_by_file: Dict[str, Dict[str, int]] = {}
         raw_applied = load_json(self.wm_settings_path, {})
         self._wm_applied_settings_by_file: Dict[str, Dict[str, int]] = {}
@@ -945,7 +949,8 @@ class MainWindow(QMainWindow):
     def _pick_dir(self, line: QLineEdit) -> None:
         d = QFileDialog.getExistingDirectory(self, "选择导入文件夹", str(self.root))
         if d:
-            self._import_selected_dirs = [Path(d).resolve()]
+            if hasattr(self, "src_import_line") and line is self.src_import_line:
+                self._import_selected_dirs = [Path(d).resolve()]
             line.setText(d)
 
     def _pick_import_dirs_multi(self) -> None:
@@ -1010,9 +1015,23 @@ class MainWindow(QMainWindow):
         form.addRow("选择导入文件夹", w)
         layout.addLayout(form)
 
-        btn = QPushButton("导入")
-        btn.clicked.connect(self.import_to_internal_library)
-        layout.addWidget(btn)
+        import_action_row = QHBoxLayout()
+        self._normalize_row_spacing(import_action_row)
+        self.btn_import_execute = QPushButton("导入")
+        self.btn_import_execute.clicked.connect(self.import_to_internal_library)
+        self.btn_import_pause = QPushButton("暂停")
+        self.btn_import_pause.clicked.connect(self.toggle_import_pause)
+        self.btn_import_stop = QPushButton("中断")
+        self.btn_import_stop.clicked.connect(self.request_import_stop)
+        self.btn_import_cancel = QPushButton("取消")
+        self.btn_import_cancel.clicked.connect(self.request_import_cancel)
+        import_action_row.addWidget(self.btn_import_execute)
+        import_action_row.addWidget(self.btn_import_pause)
+        import_action_row.addWidget(self.btn_import_stop)
+        import_action_row.addWidget(self.btn_import_cancel)
+        import_action_row.addStretch(1)
+        layout.addLayout(import_action_row)
+        self._set_import_action_buttons(running=False)
 
         group_row = QHBoxLayout()
         left_col = QVBoxLayout()
@@ -1832,6 +1851,12 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def import_to_internal_library(self) -> None:
+        src_text = self.src_import_line.text().strip() if hasattr(self, "src_import_line") else ""
+        if not src_text:
+            QMessageBox.warning(self, "提示", "请选择导入文件夹后再导入")
+            return
+        self._import_stop_mode = None
+        self._import_paused = False
         feature_import_to_internal_library(
             self,
             list_images=list_images,
@@ -1844,13 +1869,38 @@ class MainWindow(QMainWindow):
             max_import_image_bytes=MAX_IMPORT_IMAGE_BYTES,
         )
 
+    def _set_import_action_buttons(self, running: bool) -> None:
+        if hasattr(self, "btn_import_execute"):
+            self.btn_import_execute.setEnabled(not running)
+        if hasattr(self, "btn_import_pause"):
+            self.btn_import_pause.setEnabled(running)
+            self.btn_import_pause.setText("暂停")
+        if hasattr(self, "btn_import_stop"):
+            self.btn_import_stop.setEnabled(running)
+        if hasattr(self, "btn_import_cancel"):
+            self.btn_import_cancel.setEnabled(running)
+
+    def toggle_import_pause(self) -> None:
+        self._import_paused = not bool(self._import_paused)
+        if hasattr(self, "btn_import_pause"):
+            self.btn_import_pause.setText("继续" if self._import_paused else "暂停")
+        self._log(self.import_log, f"导入任务：{'已暂停' if self._import_paused else '已继续'}")
+
+    def request_import_stop(self) -> None:
+        self._import_stop_mode = "stop"
+        self._log(self.import_log, "导入任务：已请求中断")
+
+    def request_import_cancel(self) -> None:
+        self._import_stop_mode = "cancel"
+        self._log(self.import_log, "导入任务：已请求取消并回滚")
+
     def _build_group_tab(self) -> None:
         layout = QVBoxLayout(self.group_tab)
 
         cfg_row = QHBoxLayout()
         self._normalize_row_spacing(cfg_row)
         self.group_count = QSpinBox()
-        self.group_count.setRange(1, 999)
+        self.group_count.setRange(1, 2000)
         self.group_count.setValue(1)
         self.group_count.setFixedWidth(84)
         self.group_wm_selector = QComboBox()
@@ -1868,7 +1918,17 @@ class MainWindow(QMainWindow):
         self.btn_build_second = QPushButton("随机抽取(合成)")
         self.btn_build_second.clicked.connect(self.build_second_layer)
         cfg_row.addWidget(self.btn_build_second)
+        self.btn_build_second_pause = QPushButton("暂停")
+        self.btn_build_second_pause.clicked.connect(self.toggle_group_pause)
+        cfg_row.addWidget(self.btn_build_second_pause)
+        self.btn_build_second_stop = QPushButton("中断")
+        self.btn_build_second_stop.clicked.connect(self.request_group_stop)
+        cfg_row.addWidget(self.btn_build_second_stop)
+        self.btn_build_second_cancel = QPushButton("取消")
+        self.btn_build_second_cancel.clicked.connect(self.request_group_cancel)
+        cfg_row.addWidget(self.btn_build_second_cancel)
         layout.addLayout(cfg_row)
+        self._set_group_action_buttons(running=False)
 
         self.second_line = QLineEdit(str(self.second_root))
         self.export_line = QLineEdit(str(self.export_root))
@@ -2409,6 +2469,8 @@ exit 1
         return feature_resolve_candidate_item_path(self, item)
 
     def build_second_layer(self) -> None:
+        self._group_stop_mode = None
+        self._group_paused = False
         feature_build_second_layer(
             self,
             list_images=list_images,
@@ -2418,6 +2480,31 @@ exit 1
             next_folder_index=next_folder_index,
             watermark_config_cls=WatermarkConfig,
         )
+
+    def _set_group_action_buttons(self, running: bool) -> None:
+        if hasattr(self, "btn_build_second"):
+            self.btn_build_second.setEnabled(not running)
+        if hasattr(self, "btn_build_second_pause"):
+            self.btn_build_second_pause.setEnabled(running)
+            self.btn_build_second_pause.setText("暂停")
+        if hasattr(self, "btn_build_second_stop"):
+            self.btn_build_second_stop.setEnabled(running)
+        if hasattr(self, "btn_build_second_cancel"):
+            self.btn_build_second_cancel.setEnabled(running)
+
+    def toggle_group_pause(self) -> None:
+        self._group_paused = not bool(self._group_paused)
+        if hasattr(self, "btn_build_second_pause"):
+            self.btn_build_second_pause.setText("继续" if self._group_paused else "暂停")
+        self._log(self.group_log, f"抽取合成任务：{'已暂停' if self._group_paused else '已继续'}")
+
+    def request_group_stop(self) -> None:
+        self._group_stop_mode = "stop"
+        self._log(self.group_log, "抽取合成任务：已请求中断")
+
+    def request_group_cancel(self) -> None:
+        self._group_stop_mode = "cancel"
+        self._log(self.group_log, "抽取合成任务：已请求取消并回滚")
 
     def _resolve_default_preview_image(self) -> Path:
         # Prefer Qt embedded resource, extract to writable runtime path for PIL usage.
