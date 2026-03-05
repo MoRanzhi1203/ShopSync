@@ -946,15 +946,70 @@ class MainWindow(QMainWindow):
         box.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
         QApplication.processEvents()
 
-    def _pick_dir(self, line: QLineEdit) -> None:
-        d = QFileDialog.getExistingDirectory(self, "选择导入文件夹", str(self.root))
+    def _resolve_dir_dialog_start(
+        self,
+        *,
+        explicit_path: Optional[str] = None,
+        last_key: Optional[str] = None,
+        default_path: Optional[str] = None,
+    ) -> str:
+        if explicit_path:
+            p = Path(str(explicit_path).strip())
+            if p.exists() and p.is_dir():
+                return str(p)
+        if last_key:
+            m = self.app_settings.get("last_dir_map", {})
+            if isinstance(m, dict):
+                lp = str(m.get(last_key, "")).strip()
+                if lp:
+                    p = Path(lp)
+                    if p.exists() and p.is_dir():
+                        return str(p)
+        if default_path:
+            p = Path(str(default_path).strip())
+            if p.exists() and p.is_dir():
+                return str(p)
+        return ""
+
+    def _remember_last_dir(self, key: str, selected_dir: str) -> None:
+        if not key:
+            return
+        m = self.app_settings.get("last_dir_map", {})
+        if not isinstance(m, dict):
+            m = {}
+        m[key] = str(selected_dir)
+        self.app_settings["last_dir_map"] = m
+        save_json(self.settings_path, self.app_settings)
+
+    def _pick_dir(
+        self,
+        line: QLineEdit,
+        *,
+        title: str = "选择文件夹",
+        explicit_path: Optional[str] = None,
+        last_key: Optional[str] = None,
+        default_path: Optional[str] = None,
+    ) -> None:
+        start_dir = self._resolve_dir_dialog_start(
+            explicit_path=explicit_path,
+            last_key=last_key,
+            default_path=default_path,
+        )
+        d = QFileDialog.getExistingDirectory(self, title, start_dir)
         if d:
             if hasattr(self, "src_import_line") and line is self.src_import_line:
                 self._import_selected_dirs = [Path(d).resolve()]
             line.setText(d)
+            if last_key:
+                self._remember_last_dir(last_key, d)
 
     def _pick_import_dirs_multi(self) -> None:
-        dlg = QFileDialog(self, "选择导入文件夹(可多选)", str(self.root))
+        start_dir = self._resolve_dir_dialog_start(
+            explicit_path=self.src_import_line.text().strip() if hasattr(self, "src_import_line") else "",
+            last_key="import_dir_multi",
+            default_path=str(self.root),
+        )
+        dlg = QFileDialog(self, "选择导入文件夹(可多选)", start_dir)
         dlg.setFileMode(QFileDialog.Directory)
         dlg.setOption(QFileDialog.ShowDirsOnly, True)
         dlg.setOption(QFileDialog.DontUseNativeDialog, True)
@@ -979,13 +1034,36 @@ class MainWindow(QMainWindow):
         self._import_selected_dirs = selected
         if len(selected) == 1:
             self.src_import_line.setText(str(selected[0]))
+            self._remember_last_dir("import_dir_multi", str(selected[0]))
         else:
             self.src_import_line.setText(f"已选择 {len(selected)} 个一级文件夹")
+            self._remember_last_dir("import_dir_multi", str(selected[0].parent))
 
-    def _pick_file(self, line: QLineEdit, flt: str) -> None:
-        p, _ = QFileDialog.getOpenFileName(self, "选择文件", str(self.root), flt)
+    def _pick_file(
+        self,
+        line: QLineEdit,
+        flt: str,
+        *,
+        title: str = "选择文件",
+        explicit_path: Optional[str] = None,
+        last_key: Optional[str] = None,
+        default_path: Optional[str] = None,
+    ) -> None:
+        explicit_dir = ""
+        if explicit_path:
+            ep = Path(str(explicit_path).strip())
+            if ep.exists():
+                explicit_dir = str(ep if ep.is_dir() else ep.parent)
+        start_dir = self._resolve_dir_dialog_start(
+            explicit_path=explicit_dir,
+            last_key=last_key,
+            default_path=default_path,
+        )
+        p, _ = QFileDialog.getOpenFileName(self, title, start_dir, flt)
         if p:
             line.setText(p)
+            if last_key:
+                self._remember_last_dir(last_key, str(Path(p).parent))
 
     def _normalize_row_spacing(self, row_layout: QHBoxLayout) -> None:
         # Keep row spacing consistent across the app without changing overall layout structure.
@@ -1005,7 +1083,15 @@ class MainWindow(QMainWindow):
         self.src_import_line = QLineEdit("")
         self.src_import_line.textChanged.connect(self._on_import_source_text_changed)
         pick_btn = QPushButton("选择导入文件夹")
-        pick_btn.clicked.connect(lambda: self._pick_dir(self.src_import_line))
+        pick_btn.clicked.connect(
+            lambda: self._pick_dir(
+                self.src_import_line,
+                title="选择导入文件夹",
+                explicit_path="",
+                last_key="import_dir",
+                default_path="",
+            )
+        )
         row = QHBoxLayout()
         self._normalize_row_spacing(row)
         row.addWidget(self.src_import_line)
@@ -1938,7 +2024,15 @@ class MainWindow(QMainWindow):
         cache_row.addWidget(QLabel("缓存路径"))
         cache_row.addWidget(self.second_line, 1)
         btn_pick_cache = QPushButton("选择缓存路径")
-        btn_pick_cache.clicked.connect(lambda: self._pick_dir(self.second_line))
+        btn_pick_cache.clicked.connect(
+            lambda: self._pick_dir(
+                self.second_line,
+                title="选择缓存路径",
+                explicit_path=self.second_line.text().strip(),
+                last_key="cache_dir",
+                default_path=str(self.second_root),
+            )
+        )
         cache_row.addWidget(btn_pick_cache)
         layout.addLayout(cache_row)
 
@@ -1947,7 +2041,15 @@ class MainWindow(QMainWindow):
         export_row.addWidget(QLabel("导出路径"))
         export_row.addWidget(self.export_line, 1)
         btn_pick_export = QPushButton("选择导出路径")
-        btn_pick_export.clicked.connect(lambda: self._pick_dir(self.export_line))
+        btn_pick_export.clicked.connect(
+            lambda: self._pick_dir(
+                self.export_line,
+                title="选择导出路径",
+                explicit_path=self.export_line.text().strip(),
+                last_key="export_dir",
+                default_path=str(self.export_root),
+            )
+        )
         export_row.addWidget(btn_pick_export)
         layout.addLayout(export_row)
 
@@ -2540,7 +2642,16 @@ exit 1
         self._normalize_row_spacing(wm_row)
         self.watermark_file_line = QLineEdit()
         pick_wm = QPushButton("选择PNG水印文件")
-        pick_wm.clicked.connect(lambda: self._pick_file(self.watermark_file_line, "PNG Files (*.png)"))
+        pick_wm.clicked.connect(
+            lambda: self._pick_file(
+                self.watermark_file_line,
+                "PNG Files (*.png)",
+                title="选择PNG水印文件",
+                explicit_path=self.watermark_file_line.text().strip(),
+                last_key="wm_png_dir",
+                default_path="",
+            )
+        )
         wm_row.addWidget(self.watermark_file_line)
         wm_row.addWidget(pick_wm)
         w_row1 = QWidget()
@@ -3729,7 +3840,15 @@ exit 1
         f = QFormLayout(folder_box)
         self.second_line = QLineEdit(str(self.second_root))
         btn1 = QPushButton("选择第二层文件夹")
-        btn1.clicked.connect(lambda: self._pick_dir(self.second_line))
+        btn1.clicked.connect(
+            lambda: self._pick_dir(
+                self.second_line,
+                title="选择缓存路径",
+                explicit_path=self.second_line.text().strip(),
+                last_key="cache_dir",
+                default_path=str(self.second_root),
+            )
+        )
         row1 = QHBoxLayout()
         self._normalize_row_spacing(row1)
         row1.addWidget(self.second_line)
@@ -3740,7 +3859,15 @@ exit 1
 
         self.export_line = QLineEdit(str(self.export_root))
         btn2 = QPushButton("选择导出文件夹")
-        btn2.clicked.connect(lambda: self._pick_dir(self.export_line))
+        btn2.clicked.connect(
+            lambda: self._pick_dir(
+                self.export_line,
+                title="选择导出路径",
+                explicit_path=self.export_line.text().strip(),
+                last_key="export_dir",
+                default_path=str(self.export_root),
+            )
+        )
         row2 = QHBoxLayout()
         self._normalize_row_spacing(row2)
         row2.addWidget(self.export_line)
