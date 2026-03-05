@@ -86,9 +86,13 @@ def build_second_layer(
         return
     cfg_data["watermark_file"] = wm_file
     cfg = watermark_config_cls(**cfg_data)
-    if hasattr(ctx, "_get_applied_wm_rotate"):
+    if hasattr(ctx, "_effective_wm_rotate_for_file"):
+        setattr(cfg, "wm_base_rotate", int(ctx._effective_wm_rotate_for_file(wm_file)))
+    elif hasattr(ctx, "_get_applied_wm_rotate"):
         setattr(cfg, "wm_base_rotate", int(ctx._get_applied_wm_rotate(wm_file)))
-    if hasattr(ctx, "_get_applied_wm_opacity"):
+    if hasattr(ctx, "_effective_wm_opacity_for_file"):
+        setattr(cfg, "wm_base_opacity", int(ctx._effective_wm_opacity_for_file(wm_file)))
+    elif hasattr(ctx, "_get_applied_wm_opacity"):
         setattr(cfg, "wm_base_opacity", int(ctx._get_applied_wm_opacity(wm_file)))
 
     color_group_dirs = _ordered_color_group_dirs(ctx)

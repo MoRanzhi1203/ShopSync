@@ -739,9 +739,9 @@ def apply_watermark(img: Image.Image, wm: Image.Image, cfg: WatermarkConfig) -> 
         alpha = mark.getchannel("A").point(lambda x: int(x * base_opacity / 100))
         mark.putalpha(alpha)
 
-    # Scale is based on watermark's own source pixel size (100% = original watermark size).
-    target_w = max(1, int(mark.width * cfg.scale_pct / 100))
-    ratio = target_w / mark.width
+    # Scale is based on base image width, so preview/export keep same relative ratio.
+    target_w = max(1, int(base.width * cfg.scale_pct / 100))
+    ratio = target_w / max(1, mark.width)
     target_h = max(1, int(mark.height * ratio))
     mark = mark.resize((target_w, target_h), Image.Resampling.LANCZOS)
     mark = rotate_keep_scale(mark, int(cfg.rotate_deg) % 360, resample=Image.Resampling.BICUBIC)
@@ -2905,17 +2905,26 @@ exit 1
         mark = wm_layer.convert("RGBA")
         resize_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.LANCZOS
         rotate_resample = Image.Resampling.BICUBIC
-        # Keep preview consistent with export: 100% means original watermark pixel size.
-        target_w = max(1, int(mark.width * self.final_scale_slider.value() / 100))
+        # Keep the same transform order as apply_watermark():
+        # wm setting rotate/opacity -> config scale -> config rotate -> config opacity.
+        base_rotate = int(wm_setting_rotate_deg) % 360
+        if base_rotate:
+            mark = rotate_keep_scale(mark, base_rotate, resample=rotate_resample)
+        wm_opacity = max(1, min(100, int(wm_setting_opacity_pct)))
+        if wm_opacity < 100:
+            alpha = mark.getchannel("A").point(lambda x: int(x * wm_opacity / 100))
+            mark.putalpha(alpha)
+
+        base_w_for_scale = int(scale_base_width) if scale_base_width is not None else int(base.width)
+        base_w_for_scale = max(1, base_w_for_scale)
+        target_w = max(1, int(base_w_for_scale * self.final_scale_slider.value() / 100))
         ratio = target_w / max(1, mark.width)
         target_h = max(1, int(mark.height * ratio))
         mark = mark.resize((target_w, target_h), resize_resample)
         rotate_deg = self.final_rotate_slider.value() if final_rotate_override is None else int(final_rotate_override)
-        total_rotate = self._normalize_degree(int(wm_setting_rotate_deg) + int(rotate_deg))
-        mark = rotate_keep_scale(mark, total_rotate, resample=rotate_resample)
-        wm_opacity = max(1, min(100, int(wm_setting_opacity_pct)))
+        mark = rotate_keep_scale(mark, self._normalize_degree(int(rotate_deg)), resample=rotate_resample)
         final_opacity = max(1, min(100, int(self.final_opacity_slider.value())))
-        op = int(round(wm_opacity * final_opacity / 100.0))
+        op = int(round(final_opacity))
         op = max(1, min(100, op))
         if op < 100:
             alpha = mark.getchannel("A").point(lambda x: int(x * op / 100))
