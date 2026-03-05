@@ -74,6 +74,14 @@ def batch_export(
             has_checkable = True
             if it.checkState() == Qt.Checked:
                 selected_dirs.append(Path(it.data(Qt.UserRole)))
+    if has_checkable and not selected_dirs:
+        selected_items = ctx.second_folder_list.selectedItems()
+        if selected_items:
+            selected_dirs = [Path(it.data(Qt.UserRole)) for it in selected_items]
+        else:
+            cur = ctx.second_folder_list.currentItem()
+            if cur is not None:
+                selected_dirs = [Path(cur.data(Qt.UserRole))]
     if not has_checkable:
         selected_items = ctx.second_folder_list.selectedItems()
         if selected_items:

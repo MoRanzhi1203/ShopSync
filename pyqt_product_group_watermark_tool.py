@@ -5,14 +5,18 @@ import json
 import os
 import random
 import shutil
+import subprocess
 import sys
+import time
+import ctypes
+import base64
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
-from PyQt5.QtCore import QObject, QRect, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import QEvent, QObject, QRect, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractSpinBox,
@@ -1750,24 +1754,67 @@ class MainWindow(QMainWindow):
         cfg_row.addWidget(self.group_wm_selector)
         cfg_row.addWidget(QLabel("配置"))
         cfg_row.addWidget(self.group_cfg_selector)
+        cfg_row.addStretch(1)
         self.btn_build_second = QPushButton("随机抽取(合成)")
         self.btn_build_second.clicked.connect(self.build_second_layer)
         cfg_row.addWidget(self.btn_build_second)
-        cfg_row.addStretch(1)
         layout.addLayout(cfg_row)
 
         self.second_line = QLineEdit(str(self.second_root))
         self.export_line = QLineEdit(str(self.export_root))
         self.export_config_selector = QComboBox()
+        export_row = QHBoxLayout()
+        self._normalize_row_spacing(export_row)
+        export_row.addWidget(QLabel("导出路径"))
+        export_row.addWidget(self.export_line, 1)
+        btn_pick_export = QPushButton("选择导出路径")
+        btn_pick_export.clicked.connect(lambda: self._pick_dir(self.export_line))
+        export_row.addWidget(btn_pick_export)
+        layout.addLayout(export_row)
+
         group_row = QHBoxLayout()
         left_col = QVBoxLayout()
+        left_col.setSpacing(6)
         left_col.addWidget(QLabel("当前分组"))
         self.second_group_stats_label = QLabel("分组数量: 0  |  图片数量: 0")
         left_col.addWidget(self.second_group_stats_label)
+        second_batch_row = QHBoxLayout()
+        self._normalize_row_spacing(second_batch_row)
+        self.btn_second_batch_manage = QPushButton("批量管理")
+        self.btn_second_batch_manage.setCheckable(True)
+        self.btn_second_batch_manage.setMinimumWidth(92)
+        self.btn_second_batch_manage.toggled.connect(self.on_second_batch_manage_toggled)
+        second_batch_row.addWidget(self.btn_second_batch_manage)
+        second_batch_row.addStretch(1)
+        left_col.addLayout(second_batch_row)
+
+        self.second_batch_actions_wrap = QWidget()
+        second_batch_actions = QGridLayout(self.second_batch_actions_wrap)
+        second_batch_actions.setContentsMargins(0, 0, 0, 0)
+        second_batch_actions.setHorizontalSpacing(8)
+        second_batch_actions.setVerticalSpacing(6)
+        self.btn_second_select_all = QPushButton("全选")
+        self.btn_second_select_all.clicked.connect(self.select_all_second_groups)
+        self.btn_second_select_none = QPushButton("全不选")
+        self.btn_second_select_none.clicked.connect(self.clear_second_group_checks)
+        self.btn_second_batch_export = QPushButton("批量导出")
+        self.btn_second_batch_export.clicked.connect(self.batch_export_selected_second_groups)
+        self.btn_second_batch_delete = QPushButton("批量删除")
+        self.btn_second_batch_delete.clicked.connect(self.batch_delete_second_groups)
+        action_h = self.btn_second_batch_manage.sizeHint().height()
+        for btn in [self.btn_second_select_all, self.btn_second_select_none, self.btn_second_batch_export, self.btn_second_batch_delete]:
+            btn.setMinimumHeight(action_h)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        second_batch_actions.addWidget(self.btn_second_select_all, 0, 0)
+        second_batch_actions.addWidget(self.btn_second_select_none, 0, 1)
+        second_batch_actions.addWidget(self.btn_second_batch_export, 1, 0)
+        second_batch_actions.addWidget(self.btn_second_batch_delete, 1, 1)
+        left_col.addWidget(self.second_batch_actions_wrap)
         self.second_folder_list = QListWidget()
         self.second_folder_list.currentItemChanged.connect(self.on_second_group_changed)
         self.second_folder_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.second_folder_list.customContextMenuRequested.connect(self.on_second_group_context_menu)
+        self.second_folder_list.viewport().installEventFilter(self)
         self.second_folder_list.setMinimumHeight(420)
         self.second_folder_list.setMaximumWidth(280)
         left_col.addWidget(self.second_folder_list)
@@ -1783,6 +1830,13 @@ class MainWindow(QMainWindow):
         self.second_file_view_mode = QComboBox()
         self.second_file_view_mode.addItems(["列表视图", "缩略图视图"])
         self.second_file_view_mode.currentIndexChanged.connect(self.on_second_file_view_mode_changed)
+        last_mode = self.app_settings.get(
+            "second_file_view_mode",
+            self.app_settings.get("internal_file_view_mode", "缩略图视图"),
+        )
+        idx = self.second_file_view_mode.findText(str(last_mode))
+        if idx >= 0:
+            self.second_file_view_mode.setCurrentIndex(idx)
         right_ctrl_row.addWidget(self.second_file_view_mode)
         row_h = self.second_file_view_mode.sizeHint().height()
         self.second_file_view_mode.setFixedHeight(row_h)
@@ -1798,6 +1852,14 @@ class MainWindow(QMainWindow):
 
         self.second_group_file_list = QListWidget()
         self.second_group_file_list.setMinimumHeight(420)
+        self.second_group_file_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.second_group_file_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.second_group_file_list.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.second_group_file_list.verticalScrollBar().setSingleStep(12)
+        self.second_group_file_list.setStyleSheet(
+            "QListWidget::item { padding: 2px 4px; }"
+            "QListWidget::item:selected { background: #cfe8ff; color: #111; }"
+        )
         self.second_group_file_list.itemDoubleClicked.connect(self.on_second_file_double_clicked)
         right_col.addWidget(self.second_group_file_list)
         right_wrap = QWidget()
@@ -1816,6 +1878,8 @@ class MainWindow(QMainWindow):
 
         self.export_log = QTextEdit()
         self.export_log.setReadOnly(True)
+        self._second_batch_mode = False
+        self._set_second_batch_controls_visible(False)
         self.refresh_export_folder_list()
         self.refresh_export_config_list()
 
@@ -1852,36 +1916,61 @@ class MainWindow(QMainWindow):
         mode = self.second_file_view_mode.currentText() if hasattr(self, "second_file_view_mode") else "列表视图"
         imgs = [x for x in sorted(group_dir.iterdir()) if is_image_file(x)]
         if mode == "缩略图视图":
-            icon_size = QSize(120, 120)
-            self.second_group_file_list.setViewMode(QListWidget.IconMode)
+            icon_size = QSize(self.thumb_w, self.thumb_h)
+            self.second_group_file_list.setViewMode(QListView.IconMode)
             self.second_group_file_list.setIconSize(icon_size)
-            self.second_group_file_list.setGridSize(QSize(150, 165))
-            self.second_group_file_list.setResizeMode(QListWidget.Adjust)
+            self.second_group_file_list.setGridSize(QSize(self.thumb_grid_w, self.thumb_grid_h))
+            self.second_group_file_list.setResizeMode(QListView.Adjust)
+            self.second_group_file_list.setMovement(QListView.Static)
+            self.second_group_file_list.setWordWrap(True)
+            self.second_group_file_list.setSpacing(10)
+            self.second_group_file_list.setTextElideMode(Qt.ElideRight)
+            self.second_group_file_list.setWrapping(True)
+            self.second_group_file_list.setFlow(QListView.LeftToRight)
+            self.second_group_file_list.setUniformItemSizes(False)
+            placeholder = self.style().standardIcon(QStyle.SP_FileIcon)
             for pth in imgs:
                 try:
                     qpix = QPixmap(str(pth))
-                    if qpix.isNull():
-                        continue
-                    icon = QIcon(qpix.scaled(icon_size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    icon = placeholder
+                    if not qpix.isNull():
+                        icon = QIcon(qpix.scaled(icon_size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                     it = QListWidgetItem(icon, pth.name)
+                    it.setTextAlignment(Qt.AlignHCenter)
                     it.setData(Qt.UserRole, str(pth))
                     self.second_group_file_list.addItem(it)
                 except Exception:
                     continue
             return
-        self.second_group_file_list.setViewMode(QListWidget.ListMode)
-        self.second_group_file_list.setIconSize(QSize(20, 20))
+        self.second_group_file_list.setViewMode(QListView.ListMode)
+        self.second_group_file_list.setIconSize(QSize(22, 22))
         self.second_group_file_list.setGridSize(QSize())
-        self.second_group_file_list.setResizeMode(QListWidget.Fixed)
+        self.second_group_file_list.setResizeMode(QListView.Fixed)
+        self.second_group_file_list.setMovement(QListView.Static)
+        self.second_group_file_list.setWordWrap(False)
+        self.second_group_file_list.setSpacing(2)
+        self.second_group_file_list.setUniformItemSizes(True)
+        file_icon = self.style().standardIcon(QStyle.SP_FileIcon)
         for pth in imgs:
-            it = QListWidgetItem(pth.name)
+            try:
+                st = pth.stat()
+                size_kb = st.st_size / 1024.0
+                mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+                text = f"{pth.name}    {size_kb:.1f} KB    {mtime}"
+            except Exception:
+                text = pth.name
+            it = QListWidgetItem(file_icon, text)
             it.setData(Qt.UserRole, str(pth))
             self.second_group_file_list.addItem(it)
 
     def on_second_file_view_mode_changed(self, _idx: int) -> None:
+        self.app_settings["second_file_view_mode"] = self.second_file_view_mode.currentText()
+        save_json(self.settings_path, self.app_settings)
         self.on_second_group_changed(self.second_folder_list.currentItem(), None)
 
     def on_second_group_context_menu(self, pos) -> None:
+        if getattr(self, "_second_batch_mode", False):
+            return
         item = self.second_folder_list.itemAt(pos)
         if item is None:
             return
@@ -1922,10 +2011,17 @@ class MainWindow(QMainWindow):
                 if str(it.data(Qt.UserRole)) == str(group_dir):
                     item = it
                     break
+        # Right-click single export should stay in single-select mode and never leave checkboxes visible.
+        base_flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        for i in range(self.second_folder_list.count()):
+            it = self.second_folder_list.item(i)
+            it.setData(Qt.CheckStateRole, None)
+            it.setFlags(base_flags)
         self.second_folder_list.clearSelection()
         if item is not None:
             item.setSelected(True)
             self.second_folder_list.setCurrentItem(item)
+        self.second_folder_list.viewport().update()
         self.batch_export()
         self._log(self.group_log, f"导出分组: {group_dir.name}")
 
@@ -1955,6 +2051,229 @@ class MainWindow(QMainWindow):
         p = Path(str(raw))
         if p.exists() and p.is_file():
             self.view_internal_file(p)
+
+    def _set_second_batch_controls_visible(self, visible: bool) -> None:
+        if not hasattr(self, "btn_second_select_all"):
+            return
+        if hasattr(self, "second_batch_actions_wrap"):
+            self.second_batch_actions_wrap.setVisible(visible)
+            return
+        self.btn_second_select_all.setVisible(visible)
+        self.btn_second_select_none.setVisible(visible)
+        self.btn_second_batch_export.setVisible(visible)
+        self.btn_second_batch_delete.setVisible(visible)
+
+    def _apply_second_batch_mode_to_list(self, checked_paths: Optional[List[str]] = None) -> None:
+        checked = set(checked_paths or [])
+        if not hasattr(self, "second_folder_list"):
+            return
+        base_flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        for i in range(self.second_folder_list.count()):
+            it = self.second_folder_list.item(i)
+            if self._second_batch_mode:
+                it.setFlags(base_flags | Qt.ItemIsUserCheckable)
+                raw = str(it.data(Qt.UserRole))
+                it.setCheckState(Qt.Checked if raw in checked else Qt.Unchecked)
+            else:
+                it.setData(Qt.CheckStateRole, None)
+                it.setFlags(base_flags)
+        self.second_folder_list.viewport().update()
+
+    def _checked_second_group_dirs(self) -> List[Path]:
+        out: List[Path] = []
+        if not hasattr(self, "second_folder_list"):
+            return out
+        for i in range(self.second_folder_list.count()):
+            it = self.second_folder_list.item(i)
+            if not bool(it.flags() & Qt.ItemIsUserCheckable):
+                continue
+            if it.checkState() == Qt.Checked:
+                raw = it.data(Qt.UserRole)
+                if not raw:
+                    continue
+                p = Path(str(raw))
+                if p.exists() and p.is_dir():
+                    out.append(p)
+        return out
+
+    def on_second_batch_manage_toggled(self, checked: bool) -> None:
+        self._second_batch_mode = bool(checked)
+        self._set_second_batch_controls_visible(self._second_batch_mode)
+        if self._second_batch_mode:
+            self._apply_second_batch_mode_to_list(checked_paths=[])
+        else:
+            self.refresh_export_folder_list()
+            self._apply_second_batch_mode_to_list()
+            self.second_folder_list.clearSelection()
+            self.second_folder_list.viewport().update()
+        self._log(self.group_log, "开启批量管理" if checked else "关闭批量管理")
+
+    def eventFilter(self, obj, event):
+        if (
+            hasattr(self, "second_folder_list")
+            and obj is self.second_folder_list.viewport()
+            and getattr(self, "_second_batch_mode", False)
+            and event.type() == QEvent.MouseButtonRelease
+            and event.button() == Qt.LeftButton
+        ):
+            item = self.second_folder_list.itemAt(event.pos())
+            if item is not None and bool(item.flags() & Qt.ItemIsUserCheckable):
+                item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
+                self.second_folder_list.setCurrentItem(item)
+                return True
+        return super().eventFilter(obj, event)
+
+    def select_all_second_groups(self) -> None:
+        if not self._second_batch_mode:
+            return
+        for i in range(self.second_folder_list.count()):
+            it = self.second_folder_list.item(i)
+            if bool(it.flags() & Qt.ItemIsUserCheckable):
+                it.setCheckState(Qt.Checked)
+
+    def clear_second_group_checks(self) -> None:
+        if not self._second_batch_mode:
+            return
+        for i in range(self.second_folder_list.count()):
+            it = self.second_folder_list.item(i)
+            if bool(it.flags() & Qt.ItemIsUserCheckable):
+                it.setCheckState(Qt.Unchecked)
+
+    def batch_export_selected_second_groups(self) -> None:
+        if not self._second_batch_mode:
+            return
+        selected_dirs = self._checked_second_group_dirs()
+        if not selected_dirs:
+            QMessageBox.information(self, "提示", "请先勾选要导出的分组")
+            return
+        self.batch_export()
+        self._log(self.group_log, f"批量导出分组: {len(selected_dirs)} 个")
+
+    def _open_or_activate_folder(self, folder: Path) -> None:
+        if folder is None:
+            return
+        p = Path(folder)
+        if not p.exists():
+            return
+        key = str(p.resolve()).rstrip("\\/")
+        if not hasattr(self, "_explorer_hwnd_by_path"):
+            self._explorer_hwnd_by_path: Dict[str, int] = {}
+
+        # 1) Try cached window handle first.
+        hwnd = int(self._explorer_hwnd_by_path.get(key, 0) or 0)
+        if hwnd and self._activate_window_by_hwnd(hwnd):
+            return
+
+        # 2) Find an existing Explorer window for this path.
+        hwnd = self._find_explorer_hwnd_by_path(p)
+        if hwnd and self._activate_window_by_hwnd(hwnd):
+            self._explorer_hwnd_by_path[key] = hwnd
+            return
+
+        # 3) Not found: open once, then capture handle for next time.
+        try:
+            subprocess.Popen(["explorer", str(p)])
+        except Exception:
+            try:
+                os.startfile(str(p))
+            except Exception:
+                return
+
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            hwnd = self._find_explorer_hwnd_by_path(p)
+            if hwnd:
+                self._explorer_hwnd_by_path[key] = hwnd
+                break
+            time.sleep(0.08)
+
+    @staticmethod
+    def _activate_window_by_hwnd(hwnd: int) -> bool:
+        try:
+            user32 = ctypes.windll.user32
+            if not user32.IsWindow(int(hwnd)):
+                return False
+            SW_RESTORE = 9
+            user32.ShowWindow(int(hwnd), SW_RESTORE)
+            # SetForegroundWindow may return False due system foreground lock policy;
+            # treat a valid window handle as success to avoid reopening duplicate windows.
+            try:
+                user32.SetForegroundWindow(int(hwnd))
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    def _find_explorer_hwnd_by_path(self, folder: Path) -> int:
+        target = str(Path(folder).resolve())
+        ps_script = r"""
+$target = [System.IO.Path]::GetFullPath($env:CODEX_TARGET_PATH).TrimEnd('\')
+try {
+  $shell = New-Object -ComObject Shell.Application
+} catch {
+  exit 1
+}
+foreach ($w in $shell.Windows()) {
+  try {
+    $doc = $w.Document
+    if ($null -eq $doc -or $null -eq $doc.Folder) { continue }
+    $cur = [string]$doc.Folder.Self.Path
+    if ([string]::IsNullOrWhiteSpace($cur)) { continue }
+    $cur = [System.IO.Path]::GetFullPath($cur).TrimEnd('\')
+    if ($cur -ieq $target) {
+      [Console]::WriteLine([string]$w.HWND)
+      exit 0
+    }
+  } catch {}
+}
+exit 1
+"""
+        try:
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+            env = dict(os.environ)
+            env["CODEX_TARGET_PATH"] = target
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+                capture_output=True,
+                text=True,
+                creationflags=flags,
+                timeout=2.5,
+                env=env,
+            )
+            if res.returncode != 0:
+                return 0
+            out = (res.stdout or "").strip()
+            return int(out) if out.isdigit() else 0
+        except Exception:
+            return 0
+
+    def batch_delete_second_groups(self) -> None:
+        if not self._second_batch_mode:
+            return
+        dirs = self._checked_second_group_dirs()
+        if not dirs:
+            QMessageBox.information(self, "提示", "请先勾选要删除的分组")
+            return
+        ans = QMessageBox.question(
+            self,
+            "批量删除分组",
+            f"确定删除 {len(dirs)} 个分组吗？将会删除分组及其所有图片",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        deleted = 0
+        for d in dirs:
+            try:
+                shutil.rmtree(d)
+                deleted += 1
+            except Exception:
+                continue
+        self.refresh_export_folder_list()
+        self._log(self.group_log, f"批量删除分组: {deleted}/{len(dirs)} 个")
 
     def pick_candidates(self) -> None:
         return
@@ -3208,11 +3527,18 @@ class MainWindow(QMainWindow):
 
     def refresh_export_folder_list(self) -> None:
         prev_path = None
+        checked_paths: List[str] = []
         if hasattr(self, "second_folder_list"):
             cur = self.second_folder_list.currentItem()
             if cur is not None:
                 prev_path = cur.data(Qt.UserRole)
+            for i in range(self.second_folder_list.count()):
+                it = self.second_folder_list.item(i)
+                if bool(it.flags() & Qt.ItemIsUserCheckable) and it.checkState() == Qt.Checked:
+                    checked_paths.append(str(it.data(Qt.UserRole)))
         feature_refresh_export_folder_list(self, is_image_file=is_image_file)
+        if hasattr(self, "_second_batch_mode") and self._second_batch_mode:
+            self._apply_second_batch_mode_to_list(checked_paths=checked_paths)
         self._update_second_group_stats()
         if not hasattr(self, "second_folder_list"):
             return
@@ -3240,6 +3566,7 @@ class MainWindow(QMainWindow):
             is_image_file=is_image_file,
             watermark_config_cls=WatermarkConfig,
         )
+        self._open_or_activate_folder(Path(self.export_line.text().strip()))
 
 
 def main() -> None:
