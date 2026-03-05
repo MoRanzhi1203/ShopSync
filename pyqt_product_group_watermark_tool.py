@@ -477,6 +477,44 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def app_resource_base_dir() -> Path:
+    # Read-only app resource root:
+    # - source run: project directory
+    # - PyInstaller onefile/onedir: sys._MEIPASS
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        try:
+            return Path(getattr(sys, "_MEIPASS")).resolve()
+        except Exception:
+            pass
+    return Path(__file__).resolve().parent
+
+
+def app_data_base_dir() -> Path:
+    # Writable data/output root:
+    # - source run: project directory
+    # - frozen exe: directory where exe lives
+    if getattr(sys, "frozen", False):
+        try:
+            return Path(sys.executable).resolve().parent
+        except Exception:
+            pass
+    return Path(__file__).resolve().parent
+
+
+def resolve_resource_path(*parts: str) -> Path:
+    p = app_resource_base_dir()
+    for part in parts:
+        p = p / part
+    return p
+
+
+def resolve_data_path(*parts: str) -> Path:
+    p = app_data_base_dir()
+    for part in parts:
+        p = p / part
+    return p
+
+
 def load_json(path: Path, default):
     if not path.exists():
         return default
@@ -558,7 +596,7 @@ def compress_image_to_under_2mb(src: Path, dst: Path, max_bytes: int = MAX_IMPOR
                 break
 
     if best is None:
-        raise RuntimeError(f"鍘嬬缉澶辫触: {src.name}")
+        raise RuntimeError(f"打包失败: {src.name}")
     dst.write_bytes(best)
     return True, len(best)
 
@@ -700,18 +738,22 @@ def apply_watermark(img: Image.Image, wm: Image.Image, cfg: WatermarkConfig) -> 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("图片批量加水印工具")
+        self.setWindowTitle("商品分组水印工具")
         self.resize(1200, 860)
 
-        self.root = Path(__file__).resolve().parent
-        self.internal_root = self.root / "internal_library"
-        self.second_root = self.root / "second_layer"
-        self.export_root = self.root / "export_images"
-        self.watermark_root = self.root / "watermark_library" / "images"
-        self.config_root = self.root / "watermark_library" / "configs"
-        self.wm_settings_path = self.root / "watermark_library" / "wm_settings.json"
-        self.index_path = self.root / "internal_library" / "md5_index.json"
-        self.settings_path = self.root / "app_settings.json"
+        self.resource_root = app_resource_base_dir()
+        self.data_root = app_data_base_dir()
+        # Backward-compatible alias: runtime writable root.
+        self.root = self.data_root
+
+        self.internal_root = self.data_root / "internal_library"
+        self.second_root = self.data_root / "second_layer"
+        self.export_root = self.data_root / "export_images"
+        self.watermark_root = self.data_root / "watermark_library" / "images"
+        self.config_root = self.data_root / "watermark_library" / "configs"
+        self.wm_settings_path = self.data_root / "watermark_library" / "wm_settings.json"
+        self.index_path = self.data_root / "internal_library" / "md5_index.json"
+        self.settings_path = self.data_root / "app_settings.json"
 
         for p in [self.internal_root, self.second_root, self.export_root, self.watermark_root, self.config_root]:
             ensure_dir(p)
@@ -2302,7 +2344,9 @@ exit 1
 
     def _build_wm_tab(self) -> None:
         layout = QHBoxLayout(self.wm_tab)
-        self.default_preview_image = self.root / "默认预览底图.jpg"
+        self.default_preview_image = resolve_resource_path("默认预览底图.jpg")
+        if not self.default_preview_image.exists():
+            self.default_preview_image = resolve_data_path("默认预览底图.jpg")
 
         left_col = QVBoxLayout()
         right_col = QVBoxLayout()
