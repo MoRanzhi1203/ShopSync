@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
-from PyQt5.QtCore import QEvent, QObject, QRect, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import QEvent, QFile, QIODevice, QObject, QRect, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractSpinBox,
@@ -66,6 +66,7 @@ from features.watermark_config import load_selected_config as feature_load_selec
 from features.watermark_config import refresh_watermark_lists as feature_refresh_watermark_lists
 from features.watermark_config import reset_wm_settings as feature_reset_wm_settings
 from features.watermark_config import save_current_config as feature_save_current_config
+import resources_rc  # noqa: F401  # Registers Qt resources at import time.
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -515,6 +516,34 @@ def resolve_data_path(*parts: str) -> Path:
     return p
 
 
+def extract_qrc_file_to_path(qrc_path: str, dst: Path) -> bool:
+    src = QFile(qrc_path)
+    if not src.open(QIODevice.ReadOnly):
+        return False
+    try:
+        data = src.readAll()
+    finally:
+        src.close()
+    ensure_dir(dst.parent)
+    try:
+        with dst.open("wb") as f:
+            f.write(bytes(data))
+        return True
+    except Exception:
+        return False
+
+
+def is_valid_image(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except Exception:
+        return False
+
+
 def load_json(path: Path, default):
     if not path.exists():
         return default
@@ -710,9 +739,10 @@ def apply_watermark(img: Image.Image, wm: Image.Image, cfg: WatermarkConfig) -> 
         alpha = mark.getchannel("A").point(lambda x: int(x * base_opacity / 100))
         mark.putalpha(alpha)
 
-    target_w = max(8, int(base.width * cfg.scale_pct / 100))
+    # Scale is based on watermark's own source pixel size (100% = original watermark size).
+    target_w = max(1, int(mark.width * cfg.scale_pct / 100))
     ratio = target_w / mark.width
-    target_h = max(8, int(mark.height * ratio))
+    target_h = max(1, int(mark.height * ratio))
     mark = mark.resize((target_w, target_h), Image.Resampling.LANCZOS)
     mark = rotate_keep_scale(mark, int(cfg.rotate_deg) % 360, resample=Image.Resampling.BICUBIC)
 
@@ -740,25 +770,34 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("商品分组水印工具")
         self.resize(1200, 860)
+        icon_path = resolve_resource_path("shopsync_data", "assets", "app.ico")
+        if not icon_path.exists():
+            icon_path = resolve_data_path("shopsync_data", "assets", "app.ico")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
 
         self.resource_root = app_resource_base_dir()
         self.data_root = app_data_base_dir()
-        # Backward-compatible alias: runtime writable root.
-        self.root = self.data_root
 
-        self.internal_root = self.data_root / "internal_library"
-        self.second_root = self.data_root / "second_layer"
-        self.export_root = self.data_root / "export_images"
-        self.watermark_root = self.data_root / "watermark_library" / "images"
-        self.config_root = self.data_root / "watermark_library" / "configs"
-        self.wm_settings_path = self.data_root / "watermark_library" / "wm_settings.json"
-        self.index_path = self.data_root / "internal_library" / "md5_index.json"
-        self.settings_path = self.data_root / "app_settings.json"
+        # Group runtime data/output folders under one parent directory for portable deployment.
+        self.workspace_root = self.data_root / "shopsync_data"
+        # Runtime writable root for all app data.
+        self.root = self.workspace_root
+        self._migrate_legacy_data_layout()
+        self.internal_root = self.workspace_root / "internal_library"
+        self.second_root = self.workspace_root / "second_layer"
+        self.export_root = self.workspace_root / "export_images"
+        self.watermark_root = self.workspace_root / "watermark_library" / "images"
+        self.config_root = self.workspace_root / "watermark_library" / "configs"
+        self.wm_settings_path = self.workspace_root / "watermark_library" / "wm_settings.json"
+        self.index_path = self.workspace_root / "internal_library" / "md5_index.json"
+        self.settings_path = self.workspace_root / "app_settings.json"
 
         for p in [self.internal_root, self.second_root, self.export_root, self.watermark_root, self.config_root]:
             ensure_dir(p)
 
         self.md5_index: Dict[str, str] = load_json(self.index_path, {})
+        self._normalize_md5_index_paths()
         self.app_settings: Dict[str, object] = load_json(self.settings_path, {})
         self.candidate_images: List[Path] = []
         self.current_internal_group_dir: Optional[Path] = None
@@ -849,6 +888,49 @@ class MainWindow(QMainWindow):
         # Force initial preview render: show base image even without watermark.
         self.update_preview()
 
+    def _migrate_legacy_data_layout(self) -> None:
+        legacy_to_new = {
+            self.data_root / "internal_library": self.workspace_root / "internal_library",
+            self.data_root / "second_layer": self.workspace_root / "second_layer",
+            self.data_root / "export_images": self.workspace_root / "export_images",
+            self.data_root / "watermark_library": self.workspace_root / "watermark_library",
+            self.data_root / "assets": self.workspace_root / "assets",
+        }
+        ensure_dir(self.workspace_root)
+        for old_dir, new_dir in legacy_to_new.items():
+            try:
+                if old_dir.exists() and not new_dir.exists():
+                    old_dir.rename(new_dir)
+            except Exception:
+                # Ignore migration errors and continue with current layout.
+                continue
+        old_settings = self.data_root / "app_settings.json"
+        new_settings = self.workspace_root / "app_settings.json"
+        try:
+            if old_settings.exists() and not new_settings.exists():
+                old_settings.rename(new_settings)
+            elif old_settings.exists() and new_settings.exists():
+                old_settings.unlink()
+        except Exception:
+            pass
+
+    def _normalize_md5_index_paths(self) -> None:
+        if not isinstance(self.md5_index, dict):
+            self.md5_index = {}
+            return
+        normed: Dict[str, str] = {}
+        changed = False
+        for k, v in self.md5_index.items():
+            vv = str(v).replace("/", "\\")
+            low = vv.lower()
+            if low.startswith("shopsync_data\\"):
+                vv = vv[len("shopsync_data\\") :]
+                changed = True
+            normed[str(k)] = vv
+        self.md5_index = normed
+        if changed:
+            save_json(self.index_path, self.md5_index)
+
     def on_tab_changed(self, idx: int) -> None:
         # Refresh preview whenever switching to the watermark tab.
         if self.tabs.widget(idx) is self.wm_tab:
@@ -918,7 +1000,7 @@ class MainWindow(QMainWindow):
         self.src_import_line = QLineEdit("")
         self.src_import_line.textChanged.connect(self._on_import_source_text_changed)
         pick_btn = QPushButton("选择导入文件夹")
-        pick_btn.clicked.connect(self._pick_import_dirs_multi)
+        pick_btn.clicked.connect(lambda: self._pick_dir(self.src_import_line))
         row = QHBoxLayout()
         self._normalize_row_spacing(row)
         row.addWidget(self.src_import_line)
@@ -934,7 +1016,7 @@ class MainWindow(QMainWindow):
 
         group_row = QHBoxLayout()
         left_col = QVBoxLayout()
-        left_col.addWidget(QLabel("当前分组"))
+        left_col.addWidget(QLabel("颜色分组"))
         self.internal_group_stats_label = QLabel("分组数量: 0  |  图片数量: 0")
         left_col.addWidget(self.internal_group_stats_label)
         self.internal_group_list = QListWidget()
@@ -1771,16 +1853,6 @@ class MainWindow(QMainWindow):
         self.group_count.setRange(1, 999)
         self.group_count.setValue(1)
         self.group_count.setFixedWidth(84)
-        self.per_group_min = QSpinBox()
-        self.per_group_min.setRange(4, 32)
-        self.per_group_min.setValue(16)
-        self.per_group_min.setFixedWidth(84)
-        self.per_group_max = QSpinBox()
-        self.per_group_max.setRange(4, 32)
-        self.per_group_max.setValue(20)
-        self.per_group_max.setFixedWidth(84)
-        self.per_group_min.valueChanged.connect(self._on_group_size_min_changed)
-        self.per_group_max.valueChanged.connect(self._on_group_size_max_changed)
         self.group_wm_selector = QComboBox()
         self.group_wm_selector.setFixedWidth(120)
         self.group_cfg_selector = QComboBox()
@@ -1788,10 +1860,6 @@ class MainWindow(QMainWindow):
 
         cfg_row.addWidget(QLabel("分组数量"))
         cfg_row.addWidget(self.group_count)
-        cfg_row.addWidget(QLabel("每组图片数量"))
-        cfg_row.addWidget(self.per_group_min)
-        cfg_row.addWidget(QLabel("-"))
-        cfg_row.addWidget(self.per_group_max)
         cfg_row.addWidget(QLabel("水印"))
         cfg_row.addWidget(self.group_wm_selector)
         cfg_row.addWidget(QLabel("配置"))
@@ -1805,6 +1873,15 @@ class MainWindow(QMainWindow):
         self.second_line = QLineEdit(str(self.second_root))
         self.export_line = QLineEdit(str(self.export_root))
         self.export_config_selector = QComboBox()
+        cache_row = QHBoxLayout()
+        self._normalize_row_spacing(cache_row)
+        cache_row.addWidget(QLabel("缓存路径"))
+        cache_row.addWidget(self.second_line, 1)
+        btn_pick_cache = QPushButton("选择缓存路径")
+        btn_pick_cache.clicked.connect(lambda: self._pick_dir(self.second_line))
+        cache_row.addWidget(btn_pick_cache)
+        layout.addLayout(cache_row)
+
         export_row = QHBoxLayout()
         self._normalize_row_spacing(export_row)
         export_row.addWidget(QLabel("导出路径"))
@@ -1817,7 +1894,7 @@ class MainWindow(QMainWindow):
         group_row = QHBoxLayout()
         left_col = QVBoxLayout()
         left_col.setSpacing(6)
-        left_col.addWidget(QLabel("当前分组"))
+        left_col.addWidget(QLabel("最终分组"))
         self.second_group_stats_label = QLabel("分组数量: 0  |  图片数量: 0")
         left_col.addWidget(self.second_group_stats_label)
         second_batch_row = QHBoxLayout()
@@ -2342,11 +2419,24 @@ exit 1
             watermark_config_cls=WatermarkConfig,
         )
 
+    def _resolve_default_preview_image(self) -> Path:
+        # Prefer Qt embedded resource, extract to writable runtime path for PIL usage.
+        dst = resolve_data_path("shopsync_data", "assets", "images", "默认预览底图.jpg")
+        qrc_path = ":/assets/images/default_preview.jpg"
+        if not is_valid_image(dst):
+            extract_qrc_file_to_path(qrc_path, dst)
+        if is_valid_image(dst):
+            return dst
+        # Fallbacks for non-packaged source runs.
+        p = resolve_resource_path("shopsync_data", "assets", "images", "默认预览底图.jpg")
+        if is_valid_image(p):
+            return p
+        p2 = resolve_data_path("shopsync_data", "assets", "images", "默认预览底图.jpg")
+        return p2
+
     def _build_wm_tab(self) -> None:
         layout = QHBoxLayout(self.wm_tab)
-        self.default_preview_image = resolve_resource_path("默认预览底图.jpg")
-        if not self.default_preview_image.exists():
-            self.default_preview_image = resolve_data_path("默认预览底图.jpg")
+        self.default_preview_image = self._resolve_default_preview_image()
 
         left_col = QVBoxLayout()
         right_col = QVBoxLayout()
@@ -2709,11 +2799,23 @@ exit 1
         return self.wm_selector.currentText().strip()
 
     def _make_wm_selector_icon(self, p: Path, size: int = 52) -> QIcon:
-        pix = QPixmap(str(p))
-        if pix.isNull():
-            return QIcon()
-        pix = pix.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        return QIcon(pix)
+        try:
+            with Image.open(p) as im:
+                rgba = im.convert("RGBA")
+            applied_rotate = self._get_applied_wm_rotate(p.name)
+            if applied_rotate:
+                rgba = rotate_keep_scale(rgba, applied_rotate, resample=Image.Resampling.BICUBIC)
+            pix = pil_to_qpixmap(rgba)
+            if pix.isNull():
+                return QIcon()
+            pix = pix.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            return QIcon(pix)
+        except Exception:
+            pix = QPixmap(str(p))
+            if pix.isNull():
+                return QIcon()
+            pix = pix.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            return QIcon(pix)
 
     def _render_checkerboard_preview(self, src_pix: QPixmap, target_w: int, target_h: int) -> QPixmap:
         # Render PNG alpha on checkerboard background for transparent-channel visibility.
@@ -2796,15 +2898,17 @@ exit 1
         *,
         fast_mode: bool,
         final_rotate_override: Optional[int],
+        scale_base_width: Optional[int] = None,
         wm_setting_rotate_deg: int = 0,
         wm_setting_opacity_pct: int = 100,
     ) -> Image.Image:
         mark = wm_layer.convert("RGBA")
         resize_resample = Image.Resampling.BILINEAR if fast_mode else Image.Resampling.LANCZOS
         rotate_resample = Image.Resampling.BICUBIC
-        target_w = max(8, int(base.width * self.final_scale_slider.value() / 100))
+        # Keep preview consistent with export: 100% means original watermark pixel size.
+        target_w = max(1, int(mark.width * self.final_scale_slider.value() / 100))
         ratio = target_w / max(1, mark.width)
-        target_h = max(8, int(mark.height * ratio))
+        target_h = max(1, int(mark.height * ratio))
         mark = mark.resize((target_w, target_h), resize_resample)
         rotate_deg = self.final_rotate_slider.value() if final_rotate_override is None else int(final_rotate_override)
         total_rotate = self._normalize_degree(int(wm_setting_rotate_deg) + int(rotate_deg))
@@ -2850,6 +2954,7 @@ exit 1
             wm_layer,
             fast_mode=fast_mode,
             final_rotate_override=None,
+            scale_base_width=base_content_rect[2],
             wm_setting_rotate_deg=wm_setting_rotate_deg,
             wm_setting_opacity_pct=wm_setting_opacity_pct,
         )
@@ -2896,6 +3001,7 @@ exit 1
         self,
         base_img: Image.Image,
         wm_layer: Image.Image,
+        base_content_rect: Optional[Tuple[int, int, int, int]] = None,
         fast_mode: bool = False,
         use_alpha_bbox: bool = False,
         final_rotate_override: Optional[int] = None,
@@ -2910,6 +3016,7 @@ exit 1
             wm_layer,
             fast_mode=fast_mode,
             final_rotate_override=final_rotate_override,
+            scale_base_width=(base_content_rect[2] if base_content_rect else base.width),
             wm_setting_rotate_deg=wm_setting_rotate_deg,
             wm_setting_opacity_pct=wm_setting_opacity_pct,
         )
@@ -3180,6 +3287,7 @@ exit 1
                 wm_processed,
                 fast_mode=True,
                 final_rotate_override=None,
+                scale_base_width=base_content_rect[2],
             )
             mark_old, old_x, old_y = place_mark(
                 base_preview.width,
@@ -3448,6 +3556,7 @@ exit 1
                 effect_preview, self._fx_current_border_norm = self._compose_effect_preview(
                     base_preview,
                     wm_raw_actual,
+                    base_content_rect=base_content_rect,
                     fast_mode=fast_mode,
                     use_alpha_bbox=False,
                     final_rotate_override=None,
@@ -3462,6 +3571,7 @@ exit 1
                 _, self._fx_actual_border_norm = self._compose_effect_preview(
                     base_preview,
                     wm_raw_actual,
+                    base_content_rect=base_content_rect,
                     fast_mode=fast_mode,
                     use_alpha_bbox=False,
                     final_rotate_override=0,
@@ -3615,6 +3725,11 @@ exit 1
 
 def main() -> None:
     app = QApplication(sys.argv)
+    icon_path = resolve_resource_path("shopsync_data", "assets", "app.ico")
+    if not icon_path.exists():
+        icon_path = resolve_data_path("shopsync_data", "assets", "app.ico")
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     w = MainWindow()
     w.show()
     sys.exit(app.exec_())

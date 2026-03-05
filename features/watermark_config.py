@@ -74,6 +74,8 @@ def apply_wm_settings(ctx) -> None:
             ctx.wm_opacity_slider.setValue(applied_opacity)
         if hasattr(ctx, "_save_wm_settings_for_file"):
             ctx._save_wm_settings_for_file(wm_file)
+        # Refresh selector icons so applied rotation is reflected immediately.
+        ctx.refresh_watermark_lists()
         ctx.update_preview()
         ctx._log(ctx.wm_log, f"已应用水印设置(基于母版): {wm_file}")
     except Exception as e:
@@ -162,13 +164,21 @@ def refresh_watermark_lists(ctx) -> None:
             ctx.final_constrain_inside_checkbox.setChecked(True)
 
     if hasattr(ctx, "group_wm_selector"):
-        current_group_wm = ctx.group_wm_selector.currentText().strip()
+        current_group_wm = ctx.group_wm_selector.currentData()
+        if not isinstance(current_group_wm, str) or not current_group_wm:
+            current_group_wm = ctx.group_wm_selector.currentText().strip()
         ctx.group_wm_selector.blockSignals(True)
         ctx.group_wm_selector.clear()
         for p in sorted(ctx.watermark_root.glob("*.png")):
-            ctx.group_wm_selector.addItem(p.stem)
+            ctx.group_wm_selector.addItem(p.stem, p.name)
         if current_group_wm:
-            idx = ctx.group_wm_selector.findText(current_group_wm)
+            idx = -1
+            for i in range(ctx.group_wm_selector.count()):
+                if ctx.group_wm_selector.itemData(i) == current_group_wm:
+                    idx = i
+                    break
+            if idx < 0:
+                idx = ctx.group_wm_selector.findText(str(current_group_wm))
             if idx >= 0:
                 ctx.group_wm_selector.setCurrentIndex(idx)
         ctx.group_wm_selector.blockSignals(False)
@@ -234,11 +244,7 @@ def load_selected_config(ctx, *, load_json: Callable[[Path, object], object]) ->
         return
 
     ctx.cfg_name.setText(data.get("name", name))
-    wm_file = data.get("watermark_file", "")
-    for i in range(ctx.wm_selector.count()):
-        if ctx.wm_selector.itemData(i) == wm_file:
-            ctx.wm_selector.setCurrentIndex(i)
-            break
+    # Keep watermark selection unchanged when switching config.
 
     ctx.final_x_slider.setValue(int(data.get("x_pct", 50)))
     ctx.final_y_slider.setValue(int(data.get("y_pct", 50)))
