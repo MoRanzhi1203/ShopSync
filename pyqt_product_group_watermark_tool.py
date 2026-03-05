@@ -3480,6 +3480,7 @@ exit 1
                     out_path = out_path.with_suffix(".jpg")
                 composed.convert("RGB").save(out_path, "JPEG", quality=95, optimize=True)
             self._log(self.wm_log, f"已导出预览图: {out_path.name}")
+            self._open_or_activate_folder(out_path.parent)
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"{type(e).__name__}: {e}")
 
