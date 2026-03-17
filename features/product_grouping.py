@@ -1,8 +1,9 @@
 import random
 import shutil
 import time
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Callable, List, Optional, Type
+from typing import Callable, Dict, List, Optional, Set, Tuple, Type
 
 from PIL import Image
 from PyQt5.QtCore import Qt
@@ -42,6 +43,42 @@ def _ordered_color_group_dirs(ctx) -> List[Path]:
     return []
 
 
+def _build_folder_plans(
+    *,
+    folder_count: int,
+    group_image_pool: List[Tuple[Path, List[Path]]],
+    prefix: str,
+    base_idx: int,
+) -> List[Dict[str, object]]:
+    folder_plans: List[Dict[str, object]] = []
+    for i in range(folder_count):
+        folder_name = f"{prefix}{base_idx + i:04d}"
+        items: List[Dict[str, object]] = []
+        for seq, (group_dir, pool) in enumerate(group_image_pool, 1):
+            src = random.choice(pool)
+            item_key = f"{folder_name}:{seq:03d}:{src.as_posix()}"
+            items.append(
+                {
+                    "item_key": item_key,
+                    "folder_name": folder_name,
+                    "seq": seq,
+                    "src": src,
+                    "source_group_name": group_dir.name,
+                }
+            )
+        folder_plans.append({"folder_name": folder_name, "items": items})
+    return folder_plans
+
+
+def _flatten_folder_plans(folder_plans: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    picked_items: List[Dict[str, object]] = []
+    for folder_plan in folder_plans:
+        items = folder_plan.get("items", [])
+        if isinstance(items, list):
+            picked_items.extend(items)
+    return picked_items
+
+
 def build_second_layer(
     ctx,
     *,
@@ -51,12 +88,16 @@ def build_second_layer(
     ensure_dir: Callable[[Path], None],
     next_folder_index: Callable[[Path, str], int],
     watermark_config_cls: Type,
+    apply_all_watermark: bool = True,
+    select_watermark_targets: Optional[Callable[[List[Dict[str, object]]], Optional[Set[str]]]] = None,
 ) -> None:
-    def _wait_if_paused() -> bool:
+    _ = list_images
+
+    def _wait_if_paused(progress: QProgressDialog, done: int, total_tasks: int) -> bool:
         while bool(getattr(ctx, "_group_paused", False)):
             if getattr(ctx, "_group_stop_mode", None) in {"stop", "cancel"}:
                 return True
-            progress.setLabelText(f"已暂停\n总进度 {done}/{total_tasks}")
+            progress.setLabelText("已暂停 \n 总进度: {}/{}".format(done, total_tasks))
             QApplication.processEvents()
             time.sleep(0.05)
         return False
@@ -80,16 +121,16 @@ def build_second_layer(
                 wm_file = p.name
                 break
     if not wm_file:
-        QMessageBox.warning(ctx, "错误", f"未找到水印文件: {wm_stem}")
+        QMessageBox.warning(ctx, "错误", "未找到水印文件: {}".format(wm_stem))
         return
     wm_path = ctx.watermark_root / wm_file
     if not wm_path.exists():
-        QMessageBox.warning(ctx, "错误", f"水印文件不存在: {wm_file}")
+        QMessageBox.warning(ctx, "错误", "水印文件不存在: {}".format(wm_file))
         return
 
     cfg_data = load_json(ctx.config_root / f"{cfg_name}.json", None)
     if not isinstance(cfg_data, dict):
-        QMessageBox.warning(ctx, "错误", f"配置读取失败: {cfg_name}")
+        QMessageBox.warning(ctx, "错误", "配置读取失败: {}".format(cfg_name))
         return
     cfg_data["watermark_file"] = wm_file
     cfg = watermark_config_cls(**cfg_data)
@@ -107,28 +148,63 @@ def build_second_layer(
         QMessageBox.warning(ctx, "提示", "颜色分组为空")
         return
 
-    group_image_pool: List[tuple[Path, List[Path]]] = []
+    group_image_pool: List[Tuple[Path, List[Path]]] = []
     for d in color_group_dirs:
-        imgs = [p for p in sorted(d.iterdir()) if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}]
+        imgs = [
+            p for p in sorted(d.iterdir())
+            if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+        ]
         if not imgs:
-            QMessageBox.warning(ctx, "提示", f"颜色分组为空: {d.name}")
+            QMessageBox.warning(ctx, "提示", "颜色分组为空: {}".format(d.name))
             return
         group_image_pool.append((d, imgs))
 
     folder_count = int(ctx.group_count.value()) if hasattr(ctx, "group_count") else 1
     folder_count = max(1, folder_count)
-    total_groups = len(group_image_pool)
-    total_tasks = max(1, folder_count * total_groups)
     cache_root = Path(ctx.second_line.text().strip()) if hasattr(ctx, "second_line") else ctx.second_root
     ensure_dir(cache_root)
     prefix = f"{wm_stem}_{cfg_name}_"
     base_idx = next_folder_index(cache_root, prefix)
-    created = 0
-    done = 0
-    stop_mode = ""
-    created_dirs: List[Path] = []
 
-    progress = QProgressDialog("正在随机抽取并合成...", "", 0, total_tasks, ctx)
+    folder_plans = _build_folder_plans(
+        folder_count=folder_count,
+        group_image_pool=group_image_pool,
+        prefix=prefix,
+        base_idx=base_idx,
+    )
+    picked_items = _flatten_folder_plans(folder_plans)
+    if not picked_items:
+        QMessageBox.information(ctx, "提示", "没有可输出的抽取结果")
+        return
+
+    is_group_enabled = getattr(ctx, "_is_internal_group_watermark_enabled", lambda _name: True)
+    group_enabled_item_keys = {
+        str(entry["item_key"])
+        for entry in picked_items
+        if bool(is_group_enabled(str(entry.get("source_group_name", ""))))
+    }
+
+    if apply_all_watermark:
+        selected_item_keys = set(group_enabled_item_keys)
+        ctx._log(ctx.group_log, "随机抽取完成: {} 张，按分组设置自动处理水印".format(len(picked_items)))
+    else:
+        ctx._log(ctx.group_log, "随机抽取完成: {} 张，等待手动选择需要添加水印的图片".format(len(picked_items)))
+        selector = select_watermark_targets
+        selected_item_keys = selector(picked_items) if selector else set()
+        if selected_item_keys is None:
+            ctx._log(ctx.group_log, "随机抽取已取消：未确认合成")
+            ctx._group_stop_mode = None
+            return
+        selected_item_keys = set(selected_item_keys) & group_enabled_item_keys
+
+    total_tasks = len(picked_items)
+    done = 0
+    created_dirs: List[Path] = []
+    stop_mode = ""
+    watermarked_count = 0
+    copied_count = 0
+
+    progress = QProgressDialog("正在合成输出...", "", 0, total_tasks, ctx)
     progress.setWindowTitle("处理中")
     progress.setCancelButton(None)
     progress.setWindowModality(Qt.NonModal)
@@ -141,46 +217,61 @@ def build_second_layer(
     QApplication.processEvents()
 
     try:
-        with Image.open(wm_path) as wm_img:
-            for i in range(folder_count):
-                if _wait_if_paused():
+        wm_context = Image.open(wm_path) if selected_item_keys else nullcontext(None)
+        with wm_context as wm_img:
+            for folder_plan in folder_plans:
+                folder_name = str(folder_plan["folder_name"])
+                entries = list(folder_plan["items"])
+                if _wait_if_paused(progress, done, total_tasks):
                     stop_mode = str(getattr(ctx, "_group_stop_mode", ""))
                     break
                 if getattr(ctx, "_group_stop_mode", None) in {"stop", "cancel"}:
                     stop_mode = str(getattr(ctx, "_group_stop_mode", ""))
                     break
-                folder_name = f"{prefix}{base_idx + i:04d}"
+
                 out_dir = cache_root / folder_name
                 ensure_dir(out_dir)
                 created_dirs.append(out_dir)
-                created += 1
                 ok = 0
-                total = len(group_image_pool)
-                for seq, (_gdir, pool) in enumerate(group_image_pool, 1):
-                    if _wait_if_paused():
+                total = len(entries)
+
+                for entry in entries:
+                    if _wait_if_paused(progress, done, total_tasks):
                         stop_mode = str(getattr(ctx, "_group_stop_mode", ""))
                         break
                     if getattr(ctx, "_group_stop_mode", None) in {"stop", "cancel"}:
                         stop_mode = str(getattr(ctx, "_group_stop_mode", ""))
                         break
-                    src = random.choice(pool)
+
+                    src = Path(str(entry["src"]))
+                    seq = int(entry["seq"])
+                    item_key = str(entry["item_key"])
                     done += 1
                     progress.setValue(done)
-                    progress.setLabelText(f"正在合成 {folder_name} ({seq}/{total})\n总进度 {done}/{total_tasks}")
+                    progress.setLabelText("正在输出 {} ({}/{})\n总进度: {}/{}".format(folder_name, seq, total, done, total_tasks))
                     QApplication.processEvents()
+
                     try:
-                        with Image.open(src) as im:
-                            out = apply_watermark(im, wm_img, cfg)
-                        dst = out_dir / f"{folder_name}{seq:03d}.jpg"
-                        out.save(dst, "JPEG", quality=95, optimize=True)
+                        if item_key in selected_item_keys:
+                            with Image.open(src) as im:
+                                out = apply_watermark(im, wm_img, cfg)
+                            dst = out_dir / f"{folder_name}{seq:03d}.jpg"
+                            out.save(dst, "JPEG", quality=95, optimize=True)
+                            watermarked_count += 1
+                        else:
+                            dst = out_dir / f"{folder_name}{seq:03d}{src.suffix.lower() or '.jpg'}"
+                            shutil.copy2(src, dst)
+                            copied_count += 1
                         ok += 1
-                    except Exception as e:
-                        ctx._log(ctx.group_log, f"{folder_name}: 跳过 {src.name} ({type(e).__name__})")
-                ctx._log(ctx.group_log, f"{folder_name}: {ok}/{total} 张")
+                    except Exception as exc:
+                        ctx._log(ctx.group_log, "{}: 跳过 {} ({})".format(folder_name, src.name, type(exc).__name__))
+
+                ctx._log(ctx.group_log, "{}: 输出 {}/{} 张".format(folder_name, ok, total))
                 ctx.refresh_export_folder_list()
                 QApplication.processEvents()
                 if stop_mode:
                     break
+
         if not stop_mode and getattr(ctx, "_group_stop_mode", None) in {"stop", "cancel"}:
             stop_mode = str(getattr(ctx, "_group_stop_mode", ""))
     finally:
@@ -199,20 +290,22 @@ def build_second_layer(
                     removed += 1
             except Exception:
                 pass
-        ctx._log(ctx.group_log, f"已取消抽取合成并回滚: 删除分组 {removed}")
+        ctx._log(ctx.group_log, "已取消随机抽取/合成并回滚: 删除分组 {}".format(removed))
         ctx.refresh_export_folder_list()
         ctx._group_stop_mode = None
         return
 
     if stop_mode == "stop":
-        ctx._log(ctx.group_log, f"抽取合成已中断: 已生成分组 {created}")
+        ctx._log(ctx.group_log, "随机抽取/合成已中断: 已生成分组 {}".format(len(created_dirs)))
         ctx.refresh_export_folder_list()
         ctx._group_stop_mode = None
         return
 
     ctx._log(
         ctx.group_log,
-        f"完成: 生成最终分组 {created} 个；每组按颜色分组顺序各随机抽取 1 张并合成",
+        "完成: 生成最终分组 {} 个；添加水印 {} 张；直接输出 {} 张".format(
+            len(created_dirs), watermarked_count, copied_count
+        ),
     )
     ctx.refresh_export_folder_list()
     ctx._group_stop_mode = None

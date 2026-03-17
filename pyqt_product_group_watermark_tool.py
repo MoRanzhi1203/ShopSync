@@ -49,6 +49,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QCheckBox,
     QStyle,
+    QStyleOptionButton,
     QSizePolicy,
 )
 
@@ -314,6 +315,67 @@ class WatermarkComboDelegate(QStyledItemDelegate):
         _ = option, index
         return QSize(96, 76)
 
+
+class InternalGroupStatusDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        painter.save()
+        rect = option.rect
+        text = str(index.data(Qt.DisplayRole) or "")
+        if option.state & QStyle.State_Selected:
+            painter.fillRect(rect, option.palette.highlight())
+            base_color = option.palette.highlightedText().color()
+        else:
+            painter.fillRect(rect, option.palette.base())
+            base_color = option.palette.text().color()
+
+        suffix = ""
+        prefix = text
+        marker = "  ["
+        if marker in text and text.endswith("]"):
+            prefix, suffix = text.rsplit(marker, 1)
+            suffix = marker + suffix
+
+        draw_rect = rect.adjusted(6, 0, -6, 0)
+        check_state = index.data(Qt.CheckStateRole)
+        has_checkbox = check_state is not None
+        if has_checkbox:
+            indicator = QStyleOptionButton()
+            indicator.state = QStyle.State_Enabled
+            indicator.state |= QStyle.State_On if int(check_state) == int(Qt.Checked) else QStyle.State_Off
+            indicator_rect = QApplication.style().subElementRect(QStyle.SE_CheckBoxIndicator, indicator, None)
+            indicator_rect.moveLeft(draw_rect.left())
+            indicator_rect.moveTop(draw_rect.y() + (draw_rect.height() - indicator_rect.height()) // 2)
+            indicator.rect = indicator_rect
+            QApplication.style().drawPrimitive(QStyle.PE_IndicatorCheckBox, indicator, painter)
+            draw_rect.setLeft(indicator_rect.right() + 6)
+
+        fm = painter.fontMetrics()
+        suffix_width = fm.horizontalAdvance(suffix) if suffix else 0
+        prefix_rect = draw_rect.adjusted(0, 0, -suffix_width, 0) if suffix else draw_rect
+
+        painter.setPen(base_color)
+        painter.drawText(prefix_rect, Qt.AlignVCenter | Qt.AlignLeft, prefix)
+        if suffix:
+            suffix_rect = draw_rect.adjusted(max(0, draw_rect.width() - suffix_width), 0, 0, 0)
+
+            font = painter.font()
+            font.setBold(False)
+
+            if option.state & QStyle.State_Selected:
+                suffix_color = QColor(255, 255, 255)
+                if "[水印]" in suffix:
+                    font.setBold(True)
+            else:
+                suffix_color = QColor(210, 54, 57) if "[水印]" in suffix else QColor(90, 90, 90)
+
+            painter.setFont(font)
+            painter.setPen(suffix_color)
+            painter.drawText(suffix_rect, Qt.AlignVCenter | Qt.AlignLeft, suffix)
+
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        return super().sizeHint(option, index)
 
 class OverlayPreviewLabel(QLabel):
     borderChanged = pyqtSignal(object)
@@ -872,6 +934,13 @@ class MainWindow(QMainWindow):
                 }
         self._wm_selector_last_file: str = ""
         self._wm_selector_changing = False
+        self._internal_group_watermark_editing = False
+        raw_group_wm = self.app_settings.get("internal_group_watermark_enabled", {})
+        self._internal_group_watermark_enabled_map: Dict[str, bool] = {}
+        if isinstance(raw_group_wm, dict):
+            for k, v in raw_group_wm.items():
+                if isinstance(k, str):
+                    self._internal_group_watermark_enabled_map[k] = bool(v)
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -1121,11 +1190,22 @@ class MainWindow(QMainWindow):
 
         group_row = QHBoxLayout()
         left_col = QVBoxLayout()
-        left_col.addWidget(QLabel("颜色分组"))
+        group_header_row = QHBoxLayout()
+        self._normalize_row_spacing(group_header_row)
+        group_header_row.addWidget(QLabel("颜色分组"))
+        self.btn_internal_group_wm_edit = QPushButton("编辑水印状态")
+        self.btn_internal_group_wm_edit.setCheckable(True)
+        self.btn_internal_group_wm_edit.setMinimumWidth(112)
+        self.btn_internal_group_wm_edit.toggled.connect(self.toggle_internal_group_watermark_edit_mode)
+        group_header_row.addStretch(1)
+        group_header_row.addWidget(self.btn_internal_group_wm_edit)
+        left_col.addLayout(group_header_row)
         self.internal_group_stats_label = QLabel("分组数量: 0  |  图片数量: 0")
         left_col.addWidget(self.internal_group_stats_label)
         self.internal_group_list = QListWidget()
+        self.internal_group_list.setItemDelegate(InternalGroupStatusDelegate(self.internal_group_list))
         self.internal_group_list.currentItemChanged.connect(self.on_internal_group_changed)
+        self.internal_group_list.itemChanged.connect(self.on_internal_group_item_changed)
         self.internal_group_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.internal_group_list.customContextMenuRequested.connect(self.on_internal_group_context_menu)
         self.internal_group_list.setMinimumHeight(420)
@@ -1261,6 +1341,75 @@ class MainWindow(QMainWindow):
         self.app_settings["internal_group_order"] = order
         save_json(self.settings_path, self.app_settings)
 
+    def _persist_internal_group_watermark_enabled(self) -> None:
+        self.app_settings["internal_group_watermark_enabled"] = dict(self._internal_group_watermark_enabled_map)
+        save_json(self.settings_path, self.app_settings)
+
+    def _is_internal_group_watermark_enabled(self, group_name: str) -> bool:
+        return bool(self._internal_group_watermark_enabled_map.get(group_name, True))
+
+    def _set_internal_group_watermark_enabled(self, group_name: str, enabled: bool) -> None:
+        self._internal_group_watermark_enabled_map[group_name] = bool(enabled)
+        self._persist_internal_group_watermark_enabled()
+
+    def _make_internal_group_item(self, group_dir: Path, image_count: int) -> QListWidgetItem:
+        enabled = self._is_internal_group_watermark_enabled(group_dir.name)
+        suffix = "水印" if enabled else "直出"
+        item = QListWidgetItem(f"{group_dir.name} ({image_count} 图片)  [{suffix}]")
+        item.setData(Qt.UserRole, str(group_dir))
+        item.setData(Qt.UserRole + 1, group_dir.name)
+        base_flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        if self._internal_group_watermark_editing:
+            item.setFlags(base_flags | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if enabled else Qt.Unchecked)
+        else:
+            item.setFlags(base_flags)
+            item.setData(Qt.CheckStateRole, None)
+        return item
+
+    def _apply_internal_group_watermark_edit_mode_to_list(self) -> None:
+        if not hasattr(self, "internal_group_list"):
+            return
+        base_flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        self.internal_group_list.blockSignals(True)
+        for i in range(self.internal_group_list.count()):
+            item = self.internal_group_list.item(i)
+            if item is None:
+                continue
+            group_name = str(item.data(Qt.UserRole + 1) or "")
+            enabled = self._is_internal_group_watermark_enabled(group_name)
+            if self._internal_group_watermark_editing:
+                item.setFlags(base_flags | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if enabled else Qt.Unchecked)
+            else:
+                item.setData(Qt.CheckStateRole, None)
+                item.setFlags(base_flags)
+            self._sync_internal_group_watermark_item(item)
+        self.internal_group_list.blockSignals(False)
+        self.internal_group_list.viewport().update()
+
+    def toggle_internal_group_watermark_edit_mode(self, checked: bool) -> None:
+        self._internal_group_watermark_editing = bool(checked)
+        if hasattr(self, "btn_internal_group_wm_edit"):
+            self.btn_internal_group_wm_edit.setText("完成水印状态编辑" if checked else "编辑水印状态")
+        self._apply_internal_group_watermark_edit_mode_to_list()
+
+    def _sync_internal_group_watermark_item(self, item: Optional[QListWidgetItem]) -> None:
+        if item is None:
+            return
+        group_name = str(item.data(Qt.UserRole + 1) or "")
+        if not group_name:
+            return
+        if self._internal_group_watermark_editing and bool(item.flags() & Qt.ItemIsUserCheckable):
+            enabled = item.checkState() == Qt.Checked
+        else:
+            enabled = self._is_internal_group_watermark_enabled(group_name)
+        suffix = "水印" if enabled else "直出"
+        text = item.text()
+        if "  [" in text:
+            text = text.split("  [", 1)[0]
+        item.setText(f"{text}  [{suffix}]")
+
     def _get_ordered_internal_group_dirs(self) -> List[Path]:
         default_dirs = self._default_internal_group_order()
         name_to_dir = {d.name: d for d in default_dirs}
@@ -1309,7 +1458,6 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
 
     def refresh_internal_group_overview(self) -> None:
-        # Lightweight refresh for import stage: update left grouping panel and stats.
         selected_dir = None
         cur = self.internal_group_list.currentItem()
         if cur is not None:
@@ -1321,8 +1469,7 @@ class MainWindow(QMainWindow):
         self.internal_group_list.blockSignals(True)
         self.internal_group_list.clear()
         for d, cnt in groups:
-            it = QListWidgetItem(f"{d.name} ({cnt} 图片)")
-            it.setData(Qt.UserRole, str(d))
+            it = self._make_internal_group_item(d, cnt)
             self.internal_group_list.addItem(it)
         if selected_dir:
             for i in range(self.internal_group_list.count()):
@@ -1334,7 +1481,7 @@ class MainWindow(QMainWindow):
             self.internal_group_list.setCurrentRow(0)
         self.internal_group_list.blockSignals(False)
         self._update_internal_group_stats(len(groups), total_images)
-
+        
     def refresh_internal_group_list(self) -> None:
         self._stop_thumbnail_worker()
         self.internal_group_list.clear()
@@ -1342,8 +1489,7 @@ class MainWindow(QMainWindow):
         self.current_internal_group_dir = None
         groups, total_images = self._collect_internal_group_info()
         for d, cnt in groups:
-            it = QListWidgetItem(f"{d.name} ({cnt} 图片)")
-            it.setData(Qt.UserRole, str(d))
+            it = self._make_internal_group_item(d, cnt)
             self.internal_group_list.addItem(it)
         if self.internal_group_list.count() > 0:
             self.internal_group_list.setCurrentRow(0)
@@ -1562,6 +1708,9 @@ class MainWindow(QMainWindow):
             save_json(self.index_path, self.md5_index)
             order = [n for n in self._get_custom_group_order() if n != name]
             self._set_custom_group_order(order)
+            if name in self._internal_group_watermark_enabled_map:
+                self._internal_group_watermark_enabled_map.pop(name, None)
+                self._persist_internal_group_watermark_enabled()
             self._log(self.import_log, f"删除分组: {name}")
             self.refresh_internal_group_list()
         except Exception as e:
@@ -1727,8 +1876,22 @@ class MainWindow(QMainWindow):
         files = self._selected_internal_file_paths()
         self.delete_internal_files(files)
 
+    def on_internal_group_item_changed(self, item: QListWidgetItem) -> None:
+        if item is None or not bool(item.flags() & Qt.ItemIsUserCheckable):
+            return
+        group_name = str(item.data(Qt.UserRole + 1) or "")
+        if not group_name:
+            return
+        enabled = item.checkState() == Qt.Checked
+        self._set_internal_group_watermark_enabled(group_name, enabled)
+        self.internal_group_list.blockSignals(True)
+        self._sync_internal_group_watermark_item(item)
+        self.internal_group_list.blockSignals(False)
+
     def on_internal_group_changed(self, current: Optional[QListWidgetItem], previous: Optional[QListWidgetItem]) -> None:
         _ = previous
+        if current is not None:
+            self._sync_internal_group_watermark_item(current)
         self._stop_thumbnail_worker()
         self.internal_group_file_list.clear()
         self.current_internal_group_dir = None
@@ -3707,7 +3870,7 @@ exit 1
             internal_imgs = list_images(self.second_root)
             sample_path = internal_imgs[0] if internal_imgs else None
             if sample_path is None:
-                self.preview_label.setText("鏈壘鍒伴粯璁ら瑙堝簳鍥?jpg锛岃鎵嬪姩閫夋嫨棰勮搴曞浘")
+                self.preview_label.setText("未找到默认预览缩略图.jpg，请手动选择预览缩略图")
                 self._preview_rendering = False
                 return
 
@@ -3758,7 +3921,7 @@ exit 1
                     self.current_wm_preview.setText("")
                 else:
                     self.current_wm_preview.setPixmap(QPixmap())
-                    self.current_wm_preview.setText("姘村嵃棰勮澶辫触")
+                    self.current_wm_preview.setText("水印预览失败")
                 self.current_wm_name.setText(wm_path.stem)
                 # Two-layer simulation for effect preview; no persistent image data change.
                 effect_preview, self._fx_current_border_norm = self._compose_effect_preview(
