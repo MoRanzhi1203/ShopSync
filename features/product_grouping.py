@@ -9,6 +9,15 @@ from PIL import Image
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QListWidgetItem, QMessageBox, QProgressDialog
 
+from features.utils import (
+    IMAGE_EXTS,
+    apply_watermark,
+    ensure_dir,
+    is_image_file,
+    load_json,
+    next_folder_index,
+)
+
 
 def pick_candidates(ctx, *, list_images: Callable[[Path], List[Path]]) -> None:
     _ = ctx, list_images
@@ -82,16 +91,10 @@ def _flatten_folder_plans(folder_plans: List[Dict[str, object]]) -> List[Dict[st
 def build_second_layer(
     ctx,
     *,
-    list_images: Callable[[Path], List[Path]],
-    load_json: Callable[[Path, object], object],
-    apply_watermark: Callable[[Image.Image, Image.Image, object], Image.Image],
-    ensure_dir: Callable[[Path], None],
-    next_folder_index: Callable[[Path, str], int],
     watermark_config_cls: Type,
     apply_all_watermark: bool = True,
     select_watermark_targets: Optional[Callable[[List[Dict[str, object]]], Optional[Set[str]]]] = None,
 ) -> None:
-    _ = list_images
 
     def _wait_if_paused(progress: QProgressDialog, done: int, total_tasks: int) -> bool:
         while bool(getattr(ctx, "_group_paused", False)):
@@ -152,7 +155,7 @@ def build_second_layer(
     for d in color_group_dirs:
         imgs = [
             p for p in sorted(d.iterdir())
-            if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTS
         ]
         if not imgs:
             QMessageBox.warning(ctx, "提示", "颜色分组为空: {}".format(d.name))

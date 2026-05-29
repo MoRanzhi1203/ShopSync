@@ -1,10 +1,12 @@
-﻿from dataclasses import asdict
+from dataclasses import asdict
 from pathlib import Path
 import shutil
-from typing import Callable, Optional, Type
+from typing import Optional, Type
 
 from PIL import Image
 from PyQt5.QtWidgets import QMessageBox
+
+from features.utils import load_json, save_json
 
 
 def _trim_transparent_edges(png_path: Path) -> None:
@@ -216,7 +218,7 @@ def current_cfg_obj(ctx, watermark_config_cls: Type) -> Optional[object]:
     )
 
 
-def save_current_config(ctx, *, save_json: Callable[[Path, object], None], watermark_config_cls: Type) -> None:
+def save_current_config(ctx, *, watermark_config_cls: Type) -> None:
     cfg = current_cfg_obj(ctx, watermark_config_cls)
     if not cfg:
         QMessageBox.warning(ctx, "错误", "请先选择水印并填写配置名")
@@ -232,7 +234,7 @@ def save_current_config(ctx, *, save_json: Callable[[Path, object], None], water
     ctx.refresh_export_config_list()
 
 
-def load_selected_config(ctx, *, load_json: Callable[[Path, object], object]) -> None:
+def load_selected_config(ctx) -> None:
     name = ctx.config_selector.currentText().strip()
     if not name:
         if hasattr(ctx, "final_constrain_inside_checkbox"):

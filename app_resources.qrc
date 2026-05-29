@@ -1,0 +1,5 @@
+﻿<RCC>
+  <qresource prefix="/assets/images">
+    <file alias="default_preview.jpg">shopsync_data/assets/images/默认预览底图.jpg</file>
+  </qresource>
+</RCC>

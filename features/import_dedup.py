@@ -1,22 +1,26 @@
 from pathlib import Path
 import time
-from typing import Callable, List, Tuple
+from typing import List, Tuple
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QMessageBox, QProgressDialog
+
+from features.utils import (
+    MAX_IMPORT_IMAGE_BYTES,
+    compress_image_to_under_size,
+    ensure_dir,
+    is_image_file,
+    list_images,
+    md5_of_file,
+    next_image_index_in_folder,
+    save_json,
+)
 
 
 def run_import_to_internal_library(
     ctx,
     *,
-    list_images: Callable[[Path], List[Path]],
-    md5_of_file: Callable[[Path], str],
-    ensure_dir: Callable[[Path], None],
-    next_image_index_in_folder: Callable[[Path, str], int],
-    compress_image_to_under_2mb: Callable[[Path, Path, int], Tuple[bool, int]],
-    is_image_file: Callable[[Path], bool],
-    save_json: Callable[[Path, object], None],
-    max_import_image_bytes: int,
+    max_import_image_bytes: int = MAX_IMPORT_IMAGE_BYTES,
 ) -> None:
     def _wait_if_paused() -> bool:
         while bool(getattr(ctx, "_import_paused", False)):
@@ -136,7 +140,7 @@ def run_import_to_internal_library(
                 raw_ext = src_img.suffix.lower()
                 dst_name = f"{group_name}{next_idx:03d}{raw_ext}"
                 dst = dst_folder / dst_name
-                was_compressed, out_size = compress_image_to_under_2mb(src_img, dst, max_import_image_bytes)
+                was_compressed, out_size = compress_image_to_under_size(src_img, dst, max_import_image_bytes)
                 if was_compressed:
                     new_dst = dst.with_suffix(".jpg")
                     if new_dst != dst:

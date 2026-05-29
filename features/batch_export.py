@@ -1,9 +1,11 @@
 from pathlib import Path
-from typing import Callable, List, Type
+from typing import List, Type
 
 from PIL import Image
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QListWidgetItem, QMessageBox
+
+from features.utils import apply_watermark, ensure_dir, is_image_file, load_json
 
 
 def refresh_export_config_list(ctx) -> None:
@@ -17,7 +19,7 @@ def refresh_export_config_list(ctx) -> None:
             ctx.export_config_selector.setCurrentIndex(idx)
 
 
-def refresh_export_folder_list(ctx, *, is_image_file: Callable[[Path], bool]) -> None:
+def refresh_export_folder_list(ctx) -> None:
     ctx.second_folder_list.clear()
     second_root = Path(ctx.second_line.text().strip()) if hasattr(ctx, "second_line") else ctx.second_root
     if not second_root.exists():
@@ -34,10 +36,6 @@ def refresh_export_folder_list(ctx, *, is_image_file: Callable[[Path], bool]) ->
 def batch_export(
     ctx,
     *,
-    load_json: Callable[[Path, object], object],
-    apply_watermark: Callable[[Image.Image, Image.Image, object], Image.Image],
-    ensure_dir: Callable[[Path], None],
-    is_image_file: Callable[[Path], bool],
     watermark_config_cls: Type,
 ) -> None:
     cfg_name = ctx.export_config_selector.currentText().strip()
